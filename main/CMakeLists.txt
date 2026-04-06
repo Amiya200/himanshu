@@ -1,0 +1,23 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "motor.c"
+        "ultrasonic.c"
+        "telegram.c"
+        "web_server.c"
+        "html_page.c"
+    INCLUDE_DIRS "."
+    REQUIRES
+        driver
+        esp_wifi
+        esp_event
+        esp_netif
+        esp_http_server
+        esp_http_client
+        esp-tls
+esp_timer
+        nvs_flash
+        freertos
+        log
+        lwip
+)
