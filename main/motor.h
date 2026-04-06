@@ -62,7 +62,7 @@ bool motor_get_ramming(void);
  */
 void motor_set_accident(bool en);
 bool motor_get_accident(void);
-
+void motor_move_blocking(motor_dir_t dir, int duration_ms);
 /**
  * @brief  Update obstacle status from ultrasonic module each cycle.
  */

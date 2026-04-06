@@ -52,7 +52,6 @@ static void do_stop(void)
     set_pins(0, 0, 0, 0, 0, 0);
     s_current_dir = DIR_STOP;
 }
-
 static void do_forward(void)
 {
     if (s_accident) { do_stop(); return; }
@@ -61,7 +60,9 @@ static void do_forward(void)
         do_stop();
         return;
     }
-    set_pins(1, 0, 1, 0, 1, 1);
+
+    // FIXED
+    set_pins(0, 1, 1, 0, 1, 1);  // was RIGHT → now FORWARD
     s_current_dir = DIR_FORWARD;
     ESP_LOGI(TAG, "FORWARD");
 }
@@ -74,7 +75,9 @@ static void do_backward(void)
         do_stop();
         return;
     }
-    set_pins(0, 1, 0, 1, 1, 1);
+
+    // FIXED
+    set_pins(1, 0, 0, 1, 1, 1);  // was LEFT → now BACKWARD
     s_current_dir = DIR_BACKWARD;
     ESP_LOGI(TAG, "BACKWARD");
 }
@@ -82,7 +85,9 @@ static void do_backward(void)
 static void do_left(void)
 {
     if (s_accident) { do_stop(); return; }
-    set_pins(1, 0, 0, 1, 1, 1);
+
+    // FIXED  // was BACKWARD → now LEFT
+    set_pins(1, 0, 1, 0, 1, 1);  // was FORWARD → now RIGHT
     s_current_dir = DIR_LEFT;
     ESP_LOGI(TAG, "LEFT");
 }
@@ -90,15 +95,17 @@ static void do_left(void)
 static void do_right(void)
 {
     if (s_accident) { do_stop(); return; }
-    set_pins(0, 1, 1, 0, 1, 1);
+
+    // FIXED
+    set_pins(0, 1, 0, 1, 1, 1);
     s_current_dir = DIR_RIGHT;
     ESP_LOGI(TAG, "RIGHT");
 }
-
 static void do_drift_left(void)
 {
     if (s_accident) { do_stop(); return; }
-    // Left motor forward only, right motor off
+
+    // LEFT motor forward only
     set_pins(1, 0, 0, 0, 1, 1);
     s_current_dir = DIR_DRIFT_LEFT;
     ESP_LOGI(TAG, "DRIFT LEFT");
@@ -107,12 +114,12 @@ static void do_drift_left(void)
 static void do_drift_right(void)
 {
     if (s_accident) { do_stop(); return; }
-    // Right motor forward only, left motor off
+
+    // RIGHT motor forward only
     set_pins(0, 0, 1, 0, 1, 1);
     s_current_dir = DIR_DRIFT_RIGHT;
     ESP_LOGI(TAG, "DRIFT RIGHT");
 }
-
 // ================== MOTOR TASK ==================
 
 static void motor_task(void *arg)
@@ -241,4 +248,27 @@ void motor_set_obstacles(bool front, bool back)
         if (front && cur == DIR_FORWARD)  motor_stop_immediate();
         if (back  && cur == DIR_BACKWARD) motor_stop_immediate();
     }
+}
+// ================== AUTO MODE SUPPORT ==================
+
+void motor_move_blocking(motor_dir_t dir, int duration_ms)
+{
+    // Safety: if accident → don't move
+    if (s_accident) {
+        ESP_LOGW(TAG, "AUTO MOVE BLOCKED: ACCIDENT");
+        motor_stop_immediate();
+        return;
+    }
+
+    // Send movement command
+    motor_send_cmd(dir);
+
+    // Wait for movement duration
+    vTaskDelay(pdMS_TO_TICKS(duration_ms));
+
+    // Stop after movement
+    motor_send_cmd(DIR_STOP);
+
+    // Small stabilization delay
+    vTaskDelay(pdMS_TO_TICKS(100));
 }

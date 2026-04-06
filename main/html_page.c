@@ -133,6 +133,7 @@ static const char HTML_PAGE[] =
 "<button class='btn dir' id='bDL'  onpointerdown=\"mv('drift_left')\">DFT-L</button>\n"
 "<button class='btn dir' id='bFWD' onpointerdown=\"mv('forward')\">&#9650; FWD</button>\n"
 "<button class='btn dir' id='bDR'  onpointerdown=\"mv('drift_right')\">DFT-R</button>\n"
+"<button class='btn rst' onclick=\"startAuto()\">AUTO CLEAN</button>\n"
 "<button class='btn dir' id='bL'   onpointerdown=\"mv('left')\">&#9668; LEFT</button>\n"
 "<button class='btn stop-btn' id='bSTOP' onpointerdown=\"mv('stop')\">&#9632; STOP</button>\n"
 "<button class='btn dir' id='bR'   onpointerdown=\"mv('right')\">RIGHT &#9658;</button>\n"
@@ -198,6 +199,7 @@ static const char HTML_PAGE[] =
 "function mv(dir){\n"
 "  if(dir===lastCmd && dir!=='stop') return;\n" /* deduplicate same-direction spam */
 "  if(inFlight>0){pendingCmd=dir;return;}\n"
+"  if(dir === 'stop') autoRunning = false;\n"
 "  sendMove(dir);\n"
 "}\n"
 
@@ -226,7 +228,18 @@ static const char HTML_PAGE[] =
 
 "function setTail(s){fetch('/tail?state='+(s?'on':'off')).catch(function(){});}\n"
 "function resetAcc(){fetch('/reset_accident').catch(function(){});}\n"
-
+"function startAuto(){\n"
+"  fetch('/auto')\n"
+"    .then(function(res){ return res.text(); })\n"
+"    .then(function(msg){\n"
+"      console.log('AUTO:', msg);\n"
+"      // Optional UI feedback\n"
+"      alert('AUTO MODE STARTED');\n"
+"    })\n"
+"    .catch(function(){\n"
+"      console.log('AUTO FAILED');\n"
+"    });\n"
+"}\n"
 "function toggleRam(){\n"
 "  ramOn=!ramOn;\n"
 "  fetch('/ramming?state='+(ramOn?'on':'off')).catch(function(){});\n"
