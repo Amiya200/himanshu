@@ -20,16 +20,15 @@ static int  s_last_vib   = 0;
 void web_server_set_vib(int v) { s_last_vib = v; }
 bool web_server_tail_state(void) { return s_tail_light; }
 
-// ================== GRID CONFIG (persisted in RAM) ==================
-// User-configurable cleaning grid
+// ================== GRID CONFIG ==================
 typedef struct {
-    int cols;              // number of panel columns
-    int rows;              // number of panel rows
-    int panel_w_cm;        // single panel width  (cm)
-    int panel_h_cm;        // single panel height (cm)
-    int gap_cm;            // gap between panels  (cm)
-    bool wash_enabled;     // run pump while cleaning
-    bool blow_enabled;     // run blower while cleaning
+    int  cols;
+    int  rows;
+    int  panel_w_cm;
+    int  panel_h_cm;
+    int  gap_cm;
+    bool wash_enabled;
+    bool blow_enabled;
 } grid_config_t;
 
 static grid_config_t s_grid = {
@@ -45,7 +44,7 @@ static grid_config_t s_grid = {
 // ================== HELPER ==================
 
 static int get_query_param(httpd_req_t *req, const char *key,
-                           char *buf, size_t buf_sz)
+                            char *buf, size_t buf_sz)
 {
     char query[512] = {0};
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK)
@@ -158,7 +157,6 @@ static esp_err_t handle_reset_accident(httpd_req_t *req)
 }
 
 // ================== /set_grid ==================
-// Query: cols=2&rows=3&pw=100&ph=170&gap=5&wash=1&blow=0
 
 static esp_err_t handle_set_grid(httpd_req_t *req)
 {
@@ -171,16 +169,15 @@ static esp_err_t handle_set_grid(httpd_req_t *req)
     if (get_query_param(req, "wash", buf, sizeof(buf)) == 0) s_grid.wash_enabled = (atoi(buf) == 1);
     if (get_query_param(req, "blow", buf, sizeof(buf)) == 0) s_grid.blow_enabled = (atoi(buf) == 1);
 
-    // Clamp sanity
-    if (s_grid.cols < 1) s_grid.cols = 1;
-    if (s_grid.rows < 1) s_grid.rows = 1;
+    if (s_grid.cols < 1)  s_grid.cols = 1;
+    if (s_grid.rows < 1)  s_grid.rows = 1;
     if (s_grid.cols > 10) s_grid.cols = 10;
     if (s_grid.rows > 10) s_grid.rows = 10;
-    if (s_grid.panel_w_cm  < 10) s_grid.panel_w_cm  = 10;
-    if (s_grid.panel_h_cm  < 10) s_grid.panel_h_cm  = 10;
-    if (s_grid.gap_cm      < 0)  s_grid.gap_cm       = 0;
+    if (s_grid.panel_w_cm < 10) s_grid.panel_w_cm = 10;
+    if (s_grid.panel_h_cm < 10) s_grid.panel_h_cm = 10;
+    if (s_grid.gap_cm     < 0)  s_grid.gap_cm     = 0;
 
-    ESP_LOGI(TAG, "Grid set: %dx%d  panel=%dx%d cm  gap=%d cm  wash=%d blow=%d",
+    ESP_LOGI(TAG, "Grid: %dx%d panel=%dx%dcm gap=%dcm wash=%d blow=%d",
              s_grid.cols, s_grid.rows,
              s_grid.panel_w_cm, s_grid.panel_h_cm, s_grid.gap_cm,
              s_grid.wash_enabled, s_grid.blow_enabled);
@@ -214,6 +211,9 @@ static esp_err_t handle_get_grid(httpd_req_t *req)
 
 static esp_err_t handle_status(httpd_req_t *req)
 {
+    // ultrasonic_get_distances always works:
+    //   ULTRASONIC_ENABLED=0 → returns 999, 999 (no obstacle)
+    //   ULTRASONIC_ENABLED=1 → returns real sensor values
     long fd, bd;
     ultrasonic_get_distances(&fd, &bd);
 
@@ -256,16 +256,6 @@ static esp_err_t handle_404(httpd_req_t *req, httpd_err_code_t err)
 }
 
 // ================== AUTO CLEAN TASK ==================
-/*
- *  Snake-pattern across each panel column, then shift to next column.
- *
- *  For each panel column:
- *    Do (panel_h / strip_width) forward/backward strips
- *    After each strip, shift right by ~10 cm (robot width)
- *    After finishing a panel column, drive across gap to next column
- *
- *  Pump and blower are turned on/off per grid config.
- */
 
 static void auto_clean_task(void *arg)
 {
@@ -273,57 +263,44 @@ static void auto_clean_task(void *arg)
              s_grid.cols, s_grid.rows,
              s_grid.panel_w_cm, s_grid.panel_h_cm, s_grid.gap_cm);
 
-    // Number of forward/backward strips to cover panel height
-    // Robot cleaning width ~10 cm per pass
-    const int strip_width_cm   = 10;
+    const int strip_width_cm = 10;
     int passes = (s_grid.panel_h_cm + strip_width_cm - 1) / strip_width_cm;
 
-    // Turn on peripherals per config
-    if (s_grid.wash_enabled)  pump_set(true);
-    if (s_grid.blow_enabled)  blower_set(true);
+    if (s_grid.wash_enabled) pump_set(true);
+    if (s_grid.blow_enabled) blower_set(true);
 
     for (int col = 0; col < s_grid.cols; col++) {
         if (motor_get_accident()) break;
 
         ESP_LOGI(TAG, "Cleaning column %d/%d", col + 1, s_grid.cols);
 
-        // Snake across the panel height
         for (int pass = 0; pass < passes; pass++) {
             if (motor_get_accident()) goto done;
 
             motor_dir_t dir = (pass % 2 == 0) ? DIR_FORWARD : DIR_BACKWARD;
-            int travel_ms   = s_grid.panel_w_cm * MS_PER_CM;
-            motor_move_blocking(dir, travel_ms);
+            motor_move_blocking(dir, s_grid.panel_w_cm * MS_PER_CM);
 
-            // Shift one strip width toward next pass (unless last pass)
-            if (pass < passes - 1) {
-                int shift_ms = strip_width_cm * MS_PER_CM;
-                motor_move_blocking(DIR_RIGHT, shift_ms);
-            }
+            if (pass < passes - 1)
+                motor_move_blocking(DIR_RIGHT, strip_width_cm * MS_PER_CM);
         }
 
-        // Return to start of this column's left edge
-        // (re-align: turn left, move back strip offsets, turn right)
-        // Simplified: drive back across panel height to reset position
+        // Return lateral position to start of column
         {
             int return_ms = (passes - 1) * strip_width_cm * MS_PER_CM;
             if (return_ms > 0)
                 motor_move_blocking(DIR_LEFT, return_ms);
         }
 
-        // Move to next panel column (panel_w + gap)
-        if (col < s_grid.cols - 1) {
-            int col_shift_ms = (s_grid.panel_w_cm + s_grid.gap_cm) * MS_PER_CM;
-            motor_move_blocking(DIR_FORWARD, col_shift_ms);
-        }
+        // Advance to next panel column
+        if (col < s_grid.cols - 1)
+            motor_move_blocking(DIR_FORWARD,
+                                (s_grid.panel_w_cm + s_grid.gap_cm) * MS_PER_CM);
     }
 
 done:
-    // Turn off peripherals
     pump_set(false);
     blower_set(false);
     motor_send_cmd(DIR_STOP);
-
     ESP_LOGI(TAG, "AUTO CLEAN complete");
     vTaskDelete(NULL);
 }
@@ -341,12 +318,12 @@ static esp_err_t handle_auto(httpd_req_t *req)
 
 esp_err_t web_server_start(void)
 {
-    httpd_config_t cfg         = HTTPD_DEFAULT_CONFIG();
-    cfg.server_port            = HTTP_SERVER_PORT;
-    cfg.max_uri_handlers       = 16;
-    cfg.lru_purge_enable       = true;
-    cfg.recv_wait_timeout      = 3;
-    cfg.send_wait_timeout      = 3;
+    httpd_config_t cfg    = HTTPD_DEFAULT_CONFIG();
+    cfg.server_port       = HTTP_SERVER_PORT;
+    cfg.max_uri_handlers  = 16;
+    cfg.lru_purge_enable  = true;
+    cfg.recv_wait_timeout = 3;
+    cfg.send_wait_timeout = 3;
 
     ESP_LOGI(TAG, "Starting HTTP server on port %d", cfg.server_port);
     esp_err_t ret = httpd_start(&s_server, &cfg);

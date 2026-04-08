@@ -15,15 +15,12 @@ static volatile bool        s_ramming       = false;
 static volatile bool        s_accident      = false;
 static volatile bool        s_front_blocked = false;
 static volatile bool        s_back_blocked  = false;
-
-// Relay state
 static volatile bool        s_pump_on       = false;
 static volatile bool        s_blower_on     = false;
 
-// Queue holds ONE pending command at a time.
 static QueueHandle_t s_motor_queue = NULL;
 
-// ================== INTERNAL GPIO HELPERS ==================
+// ================== GPIO HELPERS ==================
 
 static void gpio_out(int pin)
 {
@@ -37,7 +34,7 @@ static void gpio_out(int pin)
     gpio_config(&cfg);
 }
 
-// Relay helper: active-LOW (LOW = relay energised = device ON)
+// Active-LOW relay: LOW = relay energised = device ON
 static inline void relay_write(int pin, bool on)
 {
     gpio_set_level(pin, on ? 0 : 1);
@@ -54,7 +51,7 @@ static inline void set_pins(int in1, int in2, int in3, int in4,
     gpio_set_level(PIN_ENB, enb);
 }
 
-// ================== RAW DRIVE (called from task only) ==================
+// ================== RAW DRIVE (motor task only) ==================
 
 static void do_stop(void)
 {
@@ -63,26 +60,28 @@ static void do_stop(void)
 }
 
 /*
- *  L298N wiring assumption (left motor on IN1/IN2/ENA, right on IN3/IN4/ENB):
+ *  L298N wiring (left motor IN1/IN2/ENA, right motor IN3/IN4/ENB):
  *
- *   FORWARD  : Left  = IN1=0 IN2=1 → CW
- *              Right = IN3=1 IN4=0 → CCW  (opposite because mirrored mounting)
+ *  FORWARD      : Left  CW   (IN1=0, IN2=1)
+ *                 Right CCW  (IN3=1, IN4=0)  ← mirrored mounting
  *
- *   BACKWARD : Left  = IN1=1 IN2=0 → CCW
- *              Right = IN3=0 IN4=1 → CW
+ *  BACKWARD     : Left  CCW  (IN1=1, IN2=0)
+ *                 Right CW   (IN3=0, IN4=1)
  *
- *   LEFT (point turn) : Left  backward (1,0), Right forward (1,0)
- *   RIGHT (point turn): Left  forward  (0,1), Right backward(0,1)
+ *  LEFT  (spin) : Left  backward, Right forward
+ *  RIGHT (spin) : Left  forward,  Right backward
  *
- *   DRIFT_LEFT  : only right motor forward  → gentle left curve
- *   DRIFT_RIGHT : only left  motor forward  → gentle right curve
+ *  DRIFT_LEFT   : Right motor only → gentle left curve
+ *  DRIFT_RIGHT  : Left  motor only → gentle right curve
+ *
+ *  Adjust IN1/IN2/IN3/IN4 logic if your motors spin the wrong way.
  */
 
 static void do_forward(void)
 {
     if (s_accident) { do_stop(); return; }
     if (!s_ramming && s_front_blocked) {
-        ESP_LOGW(TAG, "Front blocked");
+        ESP_LOGW(TAG, "Front blocked — cannot move forward");
         do_stop(); return;
     }
     set_pins(0, 1, 1, 0, 1, 1);
@@ -94,7 +93,7 @@ static void do_backward(void)
 {
     if (s_accident) { do_stop(); return; }
     if (!s_ramming && s_back_blocked) {
-        ESP_LOGW(TAG, "Back blocked");
+        ESP_LOGW(TAG, "Back blocked — cannot move backward");
         do_stop(); return;
     }
     set_pins(1, 0, 0, 1, 1, 1);
@@ -105,7 +104,6 @@ static void do_backward(void)
 static void do_left(void)
 {
     if (s_accident) { do_stop(); return; }
-    // Left motor backward, right motor forward
     set_pins(1, 0, 1, 0, 1, 1);
     s_current_dir = DIR_LEFT;
     ESP_LOGI(TAG, "LEFT");
@@ -114,7 +112,6 @@ static void do_left(void)
 static void do_right(void)
 {
     if (s_accident) { do_stop(); return; }
-    // Left motor forward, right motor backward
     set_pins(0, 1, 0, 1, 1, 1);
     s_current_dir = DIR_RIGHT;
     ESP_LOGI(TAG, "RIGHT");
@@ -123,7 +120,7 @@ static void do_right(void)
 static void do_drift_left(void)
 {
     if (s_accident) { do_stop(); return; }
-    // Right motor forward only → curves left
+    // Right motor forward only
     set_pins(0, 0, 1, 0, 1, 1);
     s_current_dir = DIR_DRIFT_LEFT;
     ESP_LOGI(TAG, "DRIFT LEFT");
@@ -132,7 +129,7 @@ static void do_drift_left(void)
 static void do_drift_right(void)
 {
     if (s_accident) { do_stop(); return; }
-    // Left motor forward only → curves right
+    // Left motor forward only
     set_pins(0, 1, 0, 0, 1, 1);
     s_current_dir = DIR_DRIFT_RIGHT;
     ESP_LOGI(TAG, "DRIFT RIGHT");
@@ -148,13 +145,13 @@ static void motor_task(void *arg)
     while (1) {
         if (xQueueReceive(s_motor_queue, &cmd, portMAX_DELAY) == pdTRUE) {
             switch (cmd.dir) {
-                case DIR_FORWARD:     do_forward();    break;
-                case DIR_BACKWARD:    do_backward();   break;
-                case DIR_LEFT:        do_left();       break;
-                case DIR_RIGHT:       do_right();      break;
-                case DIR_DRIFT_LEFT:  do_drift_left(); break;
-                case DIR_DRIFT_RIGHT: do_drift_right();break;
-                default:              do_stop();       break;
+                case DIR_FORWARD:     do_forward();     break;
+                case DIR_BACKWARD:    do_backward();    break;
+                case DIR_LEFT:        do_left();        break;
+                case DIR_RIGHT:       do_right();       break;
+                case DIR_DRIFT_LEFT:  do_drift_left();  break;
+                case DIR_DRIFT_RIGHT: do_drift_right(); break;
+                default:              do_stop();        break;
             }
         }
     }
@@ -164,18 +161,22 @@ static void motor_task(void *arg)
 
 void motor_init(void)
 {
-    // Drive motor GPIOs
-    gpio_out(PIN_ENA); gpio_out(PIN_ENB);
-    gpio_out(PIN_IN1); gpio_out(PIN_IN2);
-    gpio_out(PIN_IN3); gpio_out(PIN_IN4);
+    // Motor driver GPIO outputs
+    gpio_out(PIN_ENA);
+    gpio_out(PIN_ENB);
+    gpio_out(PIN_IN1);
+    gpio_out(PIN_IN2);
+    gpio_out(PIN_IN3);
+    gpio_out(PIN_IN4);
     gpio_out(PIN_TAIL_LIGHT);
 
-    // Relay GPIOs — initialise HIGH (relay OFF) before direction is set
+    // Relay GPIOs — drive HIGH first (relay OFF = safe default)
     gpio_out(PIN_RELAY_PUMP);
     gpio_out(PIN_RELAY_BLOWER);
-    relay_write(PIN_RELAY_PUMP,    false);
-    relay_write(PIN_RELAY_BLOWER,  false);
+    relay_write(PIN_RELAY_PUMP,   false);
+    relay_write(PIN_RELAY_BLOWER, false);
 
+    // All motor pins LOW, tail light OFF
     set_pins(0, 0, 0, 0, 0, 0);
     gpio_set_level(PIN_TAIL_LIGHT, 0);
 
@@ -185,7 +186,8 @@ void motor_init(void)
         motor_task, "motor_task", 2048, NULL,
         10, NULL, 1);
 
-    ESP_LOGI(TAG, "Motor driver + relay peripherals initialized");
+    ESP_LOGI(TAG, "Motor driver initialized — ENA=%d ENB=%d IN1=%d IN2=%d IN3=%d IN4=%d",
+             PIN_ENA, PIN_ENB, PIN_IN1, PIN_IN2, PIN_IN3, PIN_IN4);
 }
 
 void motor_send_cmd(motor_dir_t dir)
@@ -201,7 +203,7 @@ void motor_stop_immediate(void)
     do_stop();
 }
 
-motor_dir_t motor_get_direction(void)  { return s_current_dir; }
+motor_dir_t motor_get_direction(void) { return s_current_dir; }
 
 const char *motor_dir_to_str(motor_dir_t dir)
 {
@@ -221,7 +223,6 @@ void motor_set_ramming(bool en)
     s_ramming = en;
     ESP_LOGI(TAG, "Ramming mode: %s", en ? "ON" : "OFF");
 }
-
 bool motor_get_ramming(void) { return s_ramming; }
 
 void motor_set_accident(bool en)
@@ -229,12 +230,11 @@ void motor_set_accident(bool en)
     s_accident = en;
     if (en) {
         motor_stop_immediate();
-        ESP_LOGW(TAG, "Accident flag SET");
+        ESP_LOGW(TAG, "Accident flag SET - all movement blocked");
     } else {
         ESP_LOGI(TAG, "Accident flag CLEARED");
     }
 }
-
 bool motor_get_accident(void) { return s_accident; }
 
 void motor_set_obstacles(bool front, bool back)
@@ -257,7 +257,6 @@ void pump_set(bool on)
     relay_write(PIN_RELAY_PUMP, on);
     ESP_LOGI(TAG, "Water pump: %s", on ? "ON" : "OFF");
 }
-
 bool pump_get(void) { return s_pump_on; }
 
 void blower_set(bool on)
@@ -266,10 +265,9 @@ void blower_set(bool on)
     relay_write(PIN_RELAY_BLOWER, on);
     ESP_LOGI(TAG, "Air blower: %s", on ? "ON" : "OFF");
 }
-
 bool blower_get(void) { return s_blower_on; }
 
-// ================== AUTO MODE SUPPORT ==================
+// ================== AUTO MODE ==================
 
 void motor_move_blocking(motor_dir_t dir, int duration_ms)
 {

@@ -25,11 +25,9 @@ static EventGroupHandle_t s_wifi_events;
 #define WIFI_STA_CONNECTED_BIT  BIT0
 #define WIFI_STA_FAIL_BIT       BIT1
 
-static int s_sta_retries = 0;
+static int  s_sta_retries   = 0;
 static bool s_telegram_sent = false;
 
-// ================== WEB SERVER VIBRATION BRIDGE ==================
-// Forward declaration from web_server.c
 extern void web_server_set_vib(int v);
 
 // ================== WIFI EVENT HANDLER ==================
@@ -73,23 +71,21 @@ static void wifi_init(void)
 
     esp_event_handler_instance_t inst_any, inst_got_ip;
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        WIFI_EVENT, ESP_EVENT_ANY_ID,    wifi_event_handler, NULL, &inst_any));
+        WIFI_EVENT, ESP_EVENT_ANY_ID,   wifi_event_handler, NULL, &inst_any));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL, &inst_got_ip));
 
-    // STA config
     wifi_config_t sta_cfg = { 0 };
     strncpy((char*)sta_cfg.sta.ssid,     STA_SSID,     sizeof(sta_cfg.sta.ssid) - 1);
     strncpy((char*)sta_cfg.sta.password, STA_PASSWORD, sizeof(sta_cfg.sta.password) - 1);
     sta_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
 
-    // AP config
     wifi_config_t ap_cfg = { 0 };
     strncpy((char*)ap_cfg.ap.ssid,     AP_SSID,     sizeof(ap_cfg.ap.ssid) - 1);
     strncpy((char*)ap_cfg.ap.password, AP_PASSWORD, sizeof(ap_cfg.ap.password) - 1);
-    ap_cfg.ap.ssid_len   = strlen(AP_SSID);
-    ap_cfg.ap.channel    = AP_CHANNEL;
-    ap_cfg.ap.authmode   = WIFI_AUTH_WPA_WPA2_PSK;
+    ap_cfg.ap.ssid_len       = strlen(AP_SSID);
+    ap_cfg.ap.channel        = AP_CHANNEL;
+    ap_cfg.ap.authmode       = WIFI_AUTH_WPA_WPA2_PSK;
     ap_cfg.ap.max_connection = AP_MAX_CONN;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
@@ -98,9 +94,8 @@ static void wifi_init(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 
     ESP_LOGI(TAG, "WiFi AP+STA started");
-    ESP_LOGI(TAG, "AP  SSID: %s  PASS: %s", AP_SSID, AP_PASSWORD);
+    ESP_LOGI(TAG, "AP SSID: %s  PASS: %s", AP_SSID, AP_PASSWORD);
 
-    // Wait for STA result (max ~5 s)
     EventBits_t bits = xEventGroupWaitBits(
         s_wifi_events,
         WIFI_STA_CONNECTED_BIT | WIFI_STA_FAIL_BIT,
@@ -118,17 +113,29 @@ static void wifi_init(void)
 
 static void accident_task(void *arg)
 {
-    // ADC1 channel for GPIO35
     adc1_config_width(ADC_WIDTH_BIT_12);
     adc1_config_channel_atten(ADC1_CHANNEL_7, ADC_ATTEN_DB_11);
+
+    // Wait for ADC and power rails to settle before monitoring
+    ESP_LOGI(TAG, "Vibration monitor: settling for 3 s...");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    ESP_LOGI(TAG, "Vibration monitor active (threshold=%d)", VIB_THRESHOLD);
+
+    int consecutive = 0;
 
     while (1) {
         int raw = adc1_get_raw(ADC1_CHANNEL_7);
         web_server_set_vib(raw);
 
-        if (raw > VIB_THRESHOLD && !motor_get_accident()) {
-            ESP_LOGW(TAG, "ACCIDENT! Vibration=%d", raw);
+        if (raw > VIB_THRESHOLD) {
+            consecutive++;
+        } else {
+            consecutive = 0;
+        }
 
+        // Require VIB_DEBOUNCE_COUNT sustained readings to avoid false triggers
+        if (consecutive >= VIB_DEBOUNCE_COUNT && !motor_get_accident()) {
+            ESP_LOGW(TAG, "ACCIDENT! vib=%d (x%d readings)", raw, consecutive);
             motor_set_accident(true);
             gpio_set_level(PIN_TAIL_LIGHT, 1);
 
@@ -144,6 +151,7 @@ static void accident_task(void *arg)
                 telegram_send(msg);
                 s_telegram_sent = true;
             }
+            consecutive = 0;
         }
 
         vTaskDelay(pdMS_TO_TICKS(VIB_CHECK_INTERVAL_MS));
@@ -157,7 +165,7 @@ static void serial_cmd_task(void *arg)
     char buf[64];
     int  pos = 0;
 
-    ESP_LOGI(TAG, "Serial commands: ACC=simulate accident | RESET=clear accident");
+    ESP_LOGI(TAG, "Serial: ACC = simulate accident | RESET = clear accident");
 
     while (1) {
         int c = fgetc(stdin);
@@ -170,7 +178,6 @@ static void serial_cmd_task(void *arg)
             buf[pos] = '\0';
             pos = 0;
 
-            // Uppercase in-place
             for (int i = 0; buf[i]; i++) {
                 if (buf[i] >= 'a' && buf[i] <= 'z') buf[i] -= 32;
             }
@@ -181,8 +188,7 @@ static void serial_cmd_task(void *arg)
                     char msg[256];
                     snprintf(msg, sizeof(msg),
                         "*EMERGENCY ALERT: Car Accident (Manual Trigger)!*"
-                        "\n\n*Source:* Serial Command 'ACC'"
-                        "\n*State:* Movement blocked, Tail light ON"
+                        "\n\n*Source:* Serial Command"
                         "\n*Location:* %s", CAR_LOCATION);
                     telegram_send(msg);
                     s_telegram_sent = true;
@@ -197,7 +203,7 @@ static void serial_cmd_task(void *arg)
                 gpio_set_level(PIN_TAIL_LIGHT, 0);
 
             } else if (strlen(buf) > 0) {
-                ESP_LOGW(TAG, "[SERIAL] Unknown: '%s'  (use ACC or RESET)", buf);
+                ESP_LOGW(TAG, "[SERIAL] Unknown: '%s' (use ACC or RESET)", buf);
             }
         } else {
             buf[pos++] = (char)c;
@@ -210,9 +216,8 @@ static void serial_cmd_task(void *arg)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "========== ESP32 CAR STARTING ==========");
+    ESP_LOGI(TAG, "========== ESP32 SOLAR CLEANER STARTING ==========");
 
-    // NVS (required by WiFi)
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
         ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -221,28 +226,30 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    // 1. Motor driver (GPIO + FreeRTOS task) — first so pins are safe
+    // 1. Motor driver first — puts all drive pins in safe state
     motor_init();
 
-    // 2. Ultrasonic sensors
+    // 2. Ultrasonic — safe to call always.
+    //    When ULTRASONIC_ENABLED=0 in config.h it just logs a warning
+    //    and returns immediately without touching any GPIO.
     ultrasonic_init();
 
-    // 3. WiFi (AP + STA)
+    // 3. WiFi
     wifi_init();
 
-    // 4. Telegram async sender
+    // 4. Telegram
     telegram_init();
 
-    // 5. HTTP server
+    // 5. HTTP web server
     ESP_ERROR_CHECK(web_server_start());
 
-    // 6. Vibration / accident detection task
-    xTaskCreate(accident_task,    "accident_task",    3072, NULL, 6, NULL);
+    // 6. Vibration / accident task
+    xTaskCreate(accident_task,   "accident_task",   3072, NULL, 6, NULL);
 
-    // 7. Serial command task (for dev / testing)
-    xTaskCreate(serial_cmd_task,  "serial_cmd_task",  2048, NULL, 2, NULL);
+    // 7. Serial command task — needs 4096, not 2048 (fgetc pulls stdio overhead)
+    xTaskCreate(serial_cmd_task, "serial_cmd_task", 4096, NULL, 2, NULL);
 
     ESP_LOGI(TAG, "========== SETUP COMPLETE ==========");
-    ESP_LOGI(TAG, "Connect to AP: '%s'  password: '%s'", AP_SSID, AP_PASSWORD);
+    ESP_LOGI(TAG, "AP SSID: '%s'  password: '%s'", AP_SSID, AP_PASSWORD);
     ESP_LOGI(TAG, "Open browser -> http://192.168.4.1");
 }
