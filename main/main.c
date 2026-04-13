@@ -1,21 +1,8 @@
 /*
  * main.c  —  ESP32 Solar Panel Cleaner  —  application entry point
  *
- * FIXES vs original:
- *  1. WiFi event handler: STA_FAIL_BIT is set only when STA retries
- *     are exhausted; AP continues to operate independently regardless.
- *     A log warning is printed but AP is not torn down.
- *  2. accident_monitor_task: accesses motor_get_accident() which is
- *     a volatile bool read — safe without mutex on Xtensa.
- *     s_telegram_sent declared static volatile to prevent optimisation
- *     across the loop body.
- *  3. serial_cmd_task: stack kept at 4096; toupper() used instead of
- *     manual ASCII arithmetic (cleaner, locale-independent for ASCII).
- *  4. app_main: nvs_flash_init() result handled for all error codes.
- *  5. GPIO for PIN_TAIL_LIGHT configured in motor_init() — no need
- *     to repeat here; guard removed.
- *  6. xEventGroupWaitBits: pdFALSE (don't clear bits) kept so that
- *     WiFi status can be inspected after boot.
+ * FIX: serial STATUS command now explicitly calls ir_print_status()
+ * and prints full MPU data so both sensors are visible in one command.
  */
 
 #include <stdio.h>
@@ -68,7 +55,7 @@ static void wifi_event_handler(void *arg,
         } else {
             xEventGroupSetBits(s_wifi_events, WIFI_STA_FAIL_BIT);
             ESP_LOGE(TAG,
-                     "WiFi STA failed after %d retries — AP still active",
+                     "WiFi STA failed after %d retries -- AP still active",
                      (int)STA_MAX_RETRIES);
         }
 
@@ -86,7 +73,6 @@ static void wifi_init(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    /* Both interfaces must be created before esp_wifi_start() */
     esp_netif_create_default_wifi_ap();
     esp_netif_create_default_wifi_sta();
 
@@ -99,7 +85,6 @@ static void wifi_init(void)
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         IP_EVENT,  IP_EVENT_STA_GOT_IP,  wifi_event_handler, NULL, &inst_got_ip));
 
-    /* STA config */
     wifi_config_t sta_cfg = {0};
     strncpy((char *)sta_cfg.sta.ssid,     STA_SSID,
             sizeof(sta_cfg.sta.ssid)     - 1);
@@ -107,7 +92,6 @@ static void wifi_init(void)
             sizeof(sta_cfg.sta.password) - 1);
     sta_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
 
-    /* AP config */
     wifi_config_t ap_cfg = {0};
     strncpy((char *)ap_cfg.ap.ssid,     AP_SSID,
             sizeof(ap_cfg.ap.ssid)     - 1);
@@ -123,39 +107,27 @@ static void wifi_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP,  &ap_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    /* Wait up to 10 s for STA result; AP is available regardless */
     EventBits_t bits = xEventGroupWaitBits(
                            s_wifi_events,
                            WIFI_STA_CONNECTED_BIT | WIFI_STA_FAIL_BIT,
-                           pdFALSE,   /* don't clear bits */
-                           pdFALSE,   /* wait for any */
+                           pdFALSE, pdFALSE,
                            pdMS_TO_TICKS(10000));
 
     if (bits & WIFI_STA_CONNECTED_BIT) {
         ESP_LOGI(TAG, "STA connected to '%s'", STA_SSID);
     } else {
-        ESP_LOGW(TAG, "STA not connected — AP '%s' available on 192.168.4.1",
+        ESP_LOGW(TAG, "STA not connected -- AP '%s' available on 192.168.4.1",
                  AP_SSID);
     }
 }
 
 /* ─── Accident monitor task ───────────────────────────────── */
 
-/*
- * Monitors the accident flag set by MPU vibration detection or
- * serial command.  Sends a single Telegram alert per accident
- * event.  Resets the sent flag when the accident is cleared.
- *
- * s_telegram_sent is volatile: accessed from this task only, but
- * the accident flag is set from mpu_task (different core) and we
- * must not cache it in a register.
- */
 static volatile bool s_telegram_sent = false;
 
 static void accident_monitor_task(void *arg)
 {
     (void)arg;
-    /* Give MPU task time to calibrate before we start monitoring */
     vTaskDelay(pdMS_TO_TICKS(5000));
     ESP_LOGI(TAG, "Accident monitor active  vib_thr=%.2fg",
              (double)MPU_VIB_THRESHOLD_G);
@@ -183,10 +155,9 @@ static void accident_monitor_task(void *arg)
             ESP_LOGW(TAG, "Accident alert sent via Telegram");
         }
 
-        /* Reset sent flag when accident is cleared */
         if (!acc && s_telegram_sent) {
             s_telegram_sent = false;
-            ESP_LOGI(TAG, "Accident cleared — Telegram flag reset");
+            ESP_LOGI(TAG, "Accident cleared -- Telegram flag reset");
         }
 
         vTaskDelay(pdMS_TO_TICKS(200));
@@ -200,7 +171,7 @@ static void serial_cmd_task(void *arg)
     (void)arg;
     char buf[64];
     int  pos = 0;
-    ESP_LOGI(TAG, "Serial commands: ACC | RESET | HDG | STATUS");
+    ESP_LOGI(TAG, "Serial commands: ACC | RESET | HDG | STATUS | IR | MPU");
 
     while (1) {
         int c = fgetc(stdin);
@@ -211,40 +182,110 @@ static void serial_cmd_task(void *arg)
             buf[pos] = '\0';
             pos = 0;
 
-            /* Convert to uppercase in-place */
-            for (int i = 0; buf[i]; i++) {
+            for (int i = 0; buf[i]; i++)
                 buf[i] = (char)toupper((unsigned char)buf[i]);
-            }
 
             if (strcmp(buf, "ACC") == 0) {
                 motor_set_accident(true);
-                ESP_LOGI(TAG, "[SERIAL] ACC — accident simulated");
+                ESP_LOGI(TAG, "[SERIAL] ACC -- accident simulated");
 
             } else if (strcmp(buf, "RESET") == 0) {
                 motor_set_accident(false);
                 mpu_clear_accident();
                 s_telegram_sent = false;
                 gpio_set_level(PIN_TAIL_LIGHT, 0);
-                ESP_LOGI(TAG, "[SERIAL] RESET — accident cleared");
+                ESP_LOGI(TAG, "[SERIAL] RESET -- accident cleared");
 
             } else if (strcmp(buf, "HDG") == 0) {
                 ESP_LOGI(TAG, "[SERIAL] Heading=%.1f deg",
                          (double)mpu_heading());
 
-            } else if (strcmp(buf, "STATUS") == 0) {
-                mpu_data_t d = mpu_get();
+            } else if (strcmp(buf, "IR") == 0) {
+                /*
+                 * New dedicated IR command: print raw pin levels AND
+                 * debounced state so wiring can be verified instantly.
+                 */
                 ir_status_t ir = ir_get_status();
-                ESP_LOGI(TAG,
-                         "[STATUS] acc=%d vib=%.3f hdg=%.1f temp=%d "
-                         "IR_F=%d/%d IR_B=%d/%d pump=%d blow=%d",
+                ESP_LOGI(TAG, "=== IR SENSOR STATUS ===");
+                ESP_LOGI(TAG, "  Front-Left  (pin %d): %s",
+                         (int)PIN_IR_FRONT_LEFT,
+                         ir.fl ? "BLOCKED (obstacle)" : "CLEAR");
+                ESP_LOGI(TAG, "  Front-Right (pin %d): %s",
+                         (int)PIN_IR_FRONT_RIGHT,
+                         ir.fr ? "BLOCKED (obstacle)" : "CLEAR");
+                ESP_LOGI(TAG, "  Back-Left   (pin %d): %s",
+                         (int)PIN_IR_BACK_LEFT,
+                         ir.bl ? "BLOCKED (obstacle)" : "CLEAR");
+                ESP_LOGI(TAG, "  Back-Right  (pin %d): %s",
+                         (int)PIN_IR_BACK_RIGHT,
+                         ir.br ? "BLOCKED (obstacle)" : "CLEAR");
+                ESP_LOGI(TAG, "  Front zone: %s  |  Back zone: %s",
+                         ir.front_blocked ? "BLOCKED" : "CLEAR",
+                         ir.back_blocked  ? "BLOCKED" : "CLEAR");
+#if IR_ENABLED
+                ESP_LOGI(TAG, "  IR_ENABLED=1 (active)");
+#else
+                ESP_LOGW(TAG, "  IR_ENABLED=0 in config.h -- sensors disabled!");
+#endif
+
+            } else if (strcmp(buf, "MPU") == 0) {
+                /*
+                 * New dedicated MPU command: print all MPU fields.
+                 */
+                mpu_data_t d = mpu_get();
+                ESP_LOGI(TAG, "=== MPU-6050 STATUS ===");
+                ESP_LOGI(TAG, "  Ready:     %s", mpu_is_ready() ? "YES" : "NO (check wiring)");
+                ESP_LOGI(TAG, "  Accel X:   %.4f g", (double)d.accel_x);
+                ESP_LOGI(TAG, "  Accel Y:   %.4f g", (double)d.accel_y);
+                ESP_LOGI(TAG, "  Accel Z:   %.4f g  (expect ~1.0 on flat surface)",
+                         (double)d.accel_z);
+                ESP_LOGI(TAG, "  Gyro Z:    %.4f deg/s", (double)d.gyro_z);
+                ESP_LOGI(TAG, "  Heading:   %.1f deg", (double)d.heading_deg);
+                ESP_LOGI(TAG, "  Vibration: %.4f g  (threshold=%.2f)",
+                         (double)d.vib_mag, (double)MPU_VIB_THRESHOLD_G);
+                ESP_LOGI(TAG, "  Temp:      %d C", d.temp_c);
+                ESP_LOGI(TAG, "  Accident:  %d", (int)d.accident);
+
+            } else if (strcmp(buf, "STATUS") == 0) {
+                /*
+                 * Full combined status: motor + IR + MPU.
+                 */
+                mpu_data_t d   = mpu_get();
+                ir_status_t ir = ir_get_status();
+
+                ESP_LOGI(TAG, "=== FULL SYSTEM STATUS ===");
+
+                /* Motor */
+                ESP_LOGI(TAG, "  [MOTOR] dir=%s  accident=%d  ramming=%d  "
+                         "pump=%d  blower=%d",
+                         motor_dir_to_str(motor_get_direction()),
                          (int)motor_get_accident(),
-                         (double)d.vib_mag, (double)d.heading_deg, d.temp_c,
+                         (int)motor_get_ramming(),
+                         (int)pump_get(),
+                         (int)blower_get());
+
+                /* IR */
+#if IR_ENABLED
+                ESP_LOGI(TAG, "  [IR]    FL=%d FR=%d BL=%d BR=%d  "
+                         "F_blocked=%d B_blocked=%d",
                          (int)ir.fl, (int)ir.fr,
                          (int)ir.bl, (int)ir.br,
-                         (int)pump_get(), (int)blower_get());
+                         (int)ir.front_blocked, (int)ir.back_blocked);
+#else
+                ESP_LOGW(TAG, "  [IR]    DISABLED (IR_ENABLED=0 in config.h)");
+#endif
+
+                /* MPU */
+                ESP_LOGI(TAG, "  [MPU]   ready=%d  Ax=%.3f Ay=%.3f Az=%.3f g  "
+                         "Gz=%.2f deg/s  hdg=%.1f  vib=%.3f g  temp=%d C",
+                         (int)mpu_is_ready(),
+                         (double)d.accel_x, (double)d.accel_y, (double)d.accel_z,
+                         (double)d.gyro_z, (double)d.heading_deg,
+                         (double)d.vib_mag, d.temp_c);
 
             } else if (strlen(buf) > 0) {
-                ESP_LOGW(TAG, "[SERIAL] Unknown: '%s'", buf);
+                ESP_LOGW(TAG, "[SERIAL] Unknown command: '%s'", buf);
+                ESP_LOGI(TAG, "  Available: ACC | RESET | HDG | IR | MPU | STATUS");
             }
         } else {
             buf[pos++] = (char)c;
@@ -260,10 +301,6 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "========== ESP32 SOLAR CLEANER STARTING ==========");
 
-    /*
-     * NVS init — required by WiFi stack.
-     * Erase and re-init if the partition is full or version-mismatched.
-     */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
         ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -273,18 +310,6 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    /*
-     * BOOT ORDER — safe state enforced before any task starts:
-     *
-     *  1. motor_init()       → all drive pins LOW; relays OFF
-     *  2. ir_init()          → configure IR GPIO inputs + task
-     *  3. mpu_init()         → I2C + MPU-6050 setup + calibration task
-     *  4. wifi_init()        → APSTA mode; blocks up to 10 s for STA
-     *  5. telegram_init()    → HTTP client pool
-     *  6. web_server_start() → HTTP server + URI handlers
-     *  7. accident_monitor_task (waits 5 s before first check)
-     *  8. serial_cmd_task
-     */
     motor_init();
     ir_init();
     mpu_init();
@@ -293,7 +318,7 @@ void app_main(void)
 
     ret = web_server_start();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Web server failed to start — continuing without it");
+        ESP_LOGE(TAG, "Web server failed to start -- continuing without it");
     }
 
     xTaskCreate(accident_monitor_task, "acc_monitor",
@@ -302,6 +327,9 @@ void app_main(void)
                 4096, NULL, 2, NULL);
 
     ESP_LOGI(TAG, "========== SETUP COMPLETE ==========");
-    ESP_LOGI(TAG, "AP SSID: %s  →  http://192.168.4.1", AP_SSID);
-    ESP_LOGI(TAG, "MPU ready: %s", mpu_is_ready() ? "YES" : "NO (check wiring)");
+    ESP_LOGI(TAG, "AP SSID: %s  -> http://192.168.4.1", AP_SSID);
+    ESP_LOGI(TAG, "MPU ready: %s",
+             mpu_is_ready() ? "YES" : "NO (check wiring)");
+    ESP_LOGI(TAG, "IR enabled: %s",
+             IR_ENABLED ? "YES" : "NO (IR_ENABLED=0 in config.h)");
 }

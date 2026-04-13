@@ -1,18 +1,15 @@
 #pragma once
+/*
+ * ir_sensor.h  —  4-channel IR obstacle sensor public API
+ */
 
 #include <stdbool.h>
-
-/* ============================================================
- *  ir_sensor.h  —  4-channel IR obstacle sensor API
- * ============================================================ */
+#include "esp_err.h"
 
 typedef struct {
-    bool fl;            /* front-left  raw */
-    bool fr;            /* front-right raw */
-    bool bl;            /* back-left   raw */
-    bool br;            /* back-right  raw */
-    bool front_blocked; /* debounced composite */
-    bool back_blocked;  /* debounced composite */
+    bool fl, fr, bl, br;
+    bool front_blocked;
+    bool back_blocked;
 } ir_status_t;
 
 void        ir_init(void);
@@ -25,3 +22,6 @@ bool        ir_back_left(void);
 bool        ir_back_right(void);
 
 ir_status_t ir_get_status(void);
+
+/* Print current IR sensor state to serial (ESP_LOGI) */
+void        ir_print_status(void);
