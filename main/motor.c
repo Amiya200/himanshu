@@ -1,3 +1,26 @@
+/*
+ * motor.c  —  L298N motor driver + relay peripherals
+ *
+ * Obstacle blocking behaviour is conditional on IR_ENABLED:
+ *
+ *   IR_ENABLED 0  →  s_front_blocked and s_back_blocked are never
+ *                    set (they stay false forever).  motor_set_obstacles()
+ *                    becomes a no-op.  Movement is never blocked by IR.
+ *
+ *   IR_ENABLED 1  →  s_front_blocked / s_back_blocked start as false.
+ *                    The ir_task calls motor_set_obstacles() after its
+ *                    debounce count is satisfied.  do_forward() /
+ *                    do_backward() check the flags and stop if blocked
+ *                    (unless ramming mode is on).
+ *
+ * This means: when IR is disabled in config.h the car moves freely.
+ * When IR is enabled the car stops only when a sensor actually sees
+ * an obstacle (debounced).  The initial state is "clear" so the car
+ * can move immediately at boot; the IR task will raise the flag within
+ * IR_DEBOUNCE_COUNT × IR_POLL_INTERVAL_MS (≤ 150 ms) if something is
+ * actually there.
+ */
+
 #include "motor.h"
 #include "config.h"
 #include "driver/gpio.h"
@@ -5,22 +28,28 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "esp_log.h"
-#include <string.h>
 
 static const char *TAG = "MOTOR";
 
-// ================== STATE ==================
+/* ─── state ───────────────────────────────────────────────── */
 static volatile motor_dir_t s_current_dir   = DIR_STOP;
 static volatile bool        s_ramming       = false;
 static volatile bool        s_accident      = false;
-static volatile bool        s_front_blocked = false;
-static volatile bool        s_back_blocked  = false;
 static volatile bool        s_pump_on       = false;
 static volatile bool        s_blower_on     = false;
 
+/*
+ * Obstacle flags — always start false (path assumed clear).
+ * Only ever written by motor_set_obstacles(), which is only called
+ * from ir_task when IR_ENABLED == 1.  When IR_ENABLED == 0,
+ * motor_set_obstacles() is a compile-time no-op so these never change.
+ */
+static volatile bool s_front_blocked = false;
+static volatile bool s_back_blocked  = false;
+
 static QueueHandle_t s_motor_queue = NULL;
 
-// ================== GPIO HELPERS ==================
+/* ─── GPIO helpers ────────────────────────────────────────── */
 
 static void gpio_out(int pin)
 {
@@ -34,7 +63,7 @@ static void gpio_out(int pin)
     gpio_config(&cfg);
 }
 
-// Active-LOW relay: LOW = relay energised = device ON
+/* Active-LOW relay: on=true → pin LOW → relay energised */
 static inline void relay_write(int pin, bool on)
 {
     gpio_set_level(pin, on ? 0 : 1);
@@ -51,7 +80,7 @@ static inline void set_pins(int in1, int in2, int in3, int in4,
     gpio_set_level(PIN_ENB, enb);
 }
 
-// ================== RAW DRIVE (motor task only) ==================
+/* ─── raw drive (called only from motor_task) ─────────────── */
 
 static void do_stop(void)
 {
@@ -59,46 +88,30 @@ static void do_stop(void)
     s_current_dir = DIR_STOP;
 }
 
-/*
- *  L298N wiring (left motor IN1/IN2/ENA, right motor IN3/IN4/ENB):
- *
- *  FORWARD      : Left  CW   (IN1=0, IN2=1)
- *                 Right CCW  (IN3=1, IN4=0)  ← mirrored mounting
- *
- *  BACKWARD     : Left  CCW  (IN1=1, IN2=0)
- *                 Right CW   (IN3=0, IN4=1)
- *
- *  LEFT  (spin) : Left  backward, Right forward
- *  RIGHT (spin) : Left  forward,  Right backward
- *
- *  DRIFT_LEFT   : Right motor only → gentle left curve
- *  DRIFT_RIGHT  : Left  motor only → gentle right curve
- *
- *  Adjust IN1/IN2/IN3/IN4 logic if your motors spin the wrong way.
- */
-
 static void do_forward(void)
 {
     if (s_accident) { do_stop(); return; }
+#if IR_ENABLED
     if (!s_ramming && s_front_blocked) {
-        ESP_LOGW(TAG, "Front blocked — cannot move forward");
+        ESP_LOGW(TAG, "Forward blocked by IR (front)");
         do_stop(); return;
     }
+#endif
     set_pins(0, 1, 1, 0, 1, 1);
     s_current_dir = DIR_FORWARD;
-    ESP_LOGI(TAG, "FORWARD");
 }
 
 static void do_backward(void)
 {
     if (s_accident) { do_stop(); return; }
+#if IR_ENABLED
     if (!s_ramming && s_back_blocked) {
-        ESP_LOGW(TAG, "Back blocked — cannot move backward");
+        ESP_LOGW(TAG, "Backward blocked by IR (back)");
         do_stop(); return;
     }
+#endif
     set_pins(1, 0, 0, 1, 1, 1);
     s_current_dir = DIR_BACKWARD;
-    ESP_LOGI(TAG, "BACKWARD");
 }
 
 static void do_left(void)
@@ -106,7 +119,6 @@ static void do_left(void)
     if (s_accident) { do_stop(); return; }
     set_pins(1, 0, 1, 0, 1, 1);
     s_current_dir = DIR_LEFT;
-    ESP_LOGI(TAG, "LEFT");
 }
 
 static void do_right(void)
@@ -114,35 +126,30 @@ static void do_right(void)
     if (s_accident) { do_stop(); return; }
     set_pins(0, 1, 0, 1, 1, 1);
     s_current_dir = DIR_RIGHT;
-    ESP_LOGI(TAG, "RIGHT");
 }
 
 static void do_drift_left(void)
 {
     if (s_accident) { do_stop(); return; }
-    // Right motor forward only
     set_pins(0, 0, 1, 0, 1, 1);
     s_current_dir = DIR_DRIFT_LEFT;
-    ESP_LOGI(TAG, "DRIFT LEFT");
 }
 
 static void do_drift_right(void)
 {
     if (s_accident) { do_stop(); return; }
-    // Left motor forward only
     set_pins(0, 1, 0, 0, 1, 1);
     s_current_dir = DIR_DRIFT_RIGHT;
-    ESP_LOGI(TAG, "DRIFT RIGHT");
 }
 
-// ================== MOTOR TASK ==================
+/* ─── motor task ──────────────────────────────────────────── */
 
 static void motor_task(void *arg)
 {
-    motor_cmd_t cmd;
+    (void)arg;
     do_stop();
-
     while (1) {
+        motor_cmd_t cmd;
         if (xQueueReceive(s_motor_queue, &cmd, portMAX_DELAY) == pdTRUE) {
             switch (cmd.dir) {
                 case DIR_FORWARD:     do_forward();     break;
@@ -157,42 +164,40 @@ static void motor_task(void *arg)
     }
 }
 
-// ================== PUBLIC API ==================
+/* ─── public API ──────────────────────────────────────────── */
 
 void motor_init(void)
 {
-    // Motor driver GPIO outputs
-    gpio_out(PIN_ENA);
-    gpio_out(PIN_ENB);
-    gpio_out(PIN_IN1);
-    gpio_out(PIN_IN2);
-    gpio_out(PIN_IN3);
-    gpio_out(PIN_IN4);
+    gpio_out(PIN_ENA); gpio_out(PIN_ENB);
+    gpio_out(PIN_IN1); gpio_out(PIN_IN2);
+    gpio_out(PIN_IN3); gpio_out(PIN_IN4);
     gpio_out(PIN_TAIL_LIGHT);
-
-    // Relay GPIOs — drive HIGH first (relay OFF = safe default)
     gpio_out(PIN_RELAY_PUMP);
     gpio_out(PIN_RELAY_BLOWER);
+
+    set_pins(0, 0, 0, 0, 0, 0);
+    gpio_set_level(PIN_TAIL_LIGHT, 0);
     relay_write(PIN_RELAY_PUMP,   false);
     relay_write(PIN_RELAY_BLOWER, false);
 
-    // All motor pins LOW, tail light OFF
-    set_pins(0, 0, 0, 0, 0, 0);
-    gpio_set_level(PIN_TAIL_LIGHT, 0);
-
     s_motor_queue = xQueueCreate(1, sizeof(motor_cmd_t));
+    configASSERT(s_motor_queue);
 
-    xTaskCreatePinnedToCore(
-        motor_task, "motor_task", 2048, NULL,
-        10, NULL, 1);
+    xTaskCreatePinnedToCore(motor_task, "motor_task",
+                            2048, NULL, 10, NULL, 1);
 
-    ESP_LOGI(TAG, "Motor driver initialized — ENA=%d ENB=%d IN1=%d IN2=%d IN3=%d IN4=%d",
-             PIN_ENA, PIN_ENB, PIN_IN1, PIN_IN2, PIN_IN3, PIN_IN4);
+    ESP_LOGI(TAG,
+             "Motor init OK  ENA=%d ENB=%d IN1-4=%d,%d,%d,%d  "
+             "PUMP=%d BLOW=%d  IR_obstacle_blocking=%s",
+             (int)PIN_ENA, (int)PIN_ENB,
+             (int)PIN_IN1, (int)PIN_IN2, (int)PIN_IN3, (int)PIN_IN4,
+             (int)PIN_RELAY_PUMP, (int)PIN_RELAY_BLOWER,
+             IR_ENABLED ? "ENABLED" : "DISABLED");
 }
 
 void motor_send_cmd(motor_dir_t dir)
 {
-    if (s_motor_queue == NULL) return;
+    if (!s_motor_queue) return;
     motor_cmd_t cmd = { .dir = dir };
     xQueueOverwrite(s_motor_queue, &cmd);
 }
@@ -212,8 +217,8 @@ const char *motor_dir_to_str(motor_dir_t dir)
         case DIR_BACKWARD:    return "BACKWARD";
         case DIR_LEFT:        return "LEFT";
         case DIR_RIGHT:       return "RIGHT";
-        case DIR_DRIFT_LEFT:  return "DRIFT LEFT";
-        case DIR_DRIFT_RIGHT: return "DRIFT RIGHT";
+        case DIR_DRIFT_LEFT:  return "DRIFT_LEFT";
+        case DIR_DRIFT_RIGHT: return "DRIFT_RIGHT";
         default:              return "STOP";
     }
 }
@@ -221,7 +226,7 @@ const char *motor_dir_to_str(motor_dir_t dir)
 void motor_set_ramming(bool en)
 {
     s_ramming = en;
-    ESP_LOGI(TAG, "Ramming mode: %s", en ? "ON" : "OFF");
+    ESP_LOGI(TAG, "Ramming: %s", en ? "ON" : "OFF");
 }
 bool motor_get_ramming(void) { return s_ramming; }
 
@@ -230,32 +235,43 @@ void motor_set_accident(bool en)
     s_accident = en;
     if (en) {
         motor_stop_immediate();
-        ESP_LOGW(TAG, "Accident flag SET - all movement blocked");
+        pump_set(false);
+        blower_set(false);
+        ESP_LOGW(TAG, "ACCIDENT SET — all motion blocked, peripherals off");
     } else {
-        ESP_LOGI(TAG, "Accident flag CLEARED");
+        ESP_LOGI(TAG, "Accident cleared");
     }
 }
 bool motor_get_accident(void) { return s_accident; }
 
+/*
+ * motor_set_obstacles() — only called by ir_task when IR_ENABLED == 1.
+ * When IR_ENABLED == 0 this function still compiles (no #if guard here)
+ * but ir_task itself is compiled out, so it is never called.
+ * The do_forward() / do_backward() checks are inside #if IR_ENABLED
+ * blocks, so the flags have no effect even if someone calls this manually.
+ */
 void motor_set_obstacles(bool front, bool back)
 {
     s_front_blocked = front;
     s_back_blocked  = back;
 
+#if IR_ENABLED
     if (!s_ramming) {
-        motor_dir_t cur = s_current_dir;
-        if (front && cur == DIR_FORWARD)  motor_stop_immediate();
-        if (back  && cur == DIR_BACKWARD) motor_stop_immediate();
+        if (front && s_current_dir == DIR_FORWARD)  motor_stop_immediate();
+        if (back  && s_current_dir == DIR_BACKWARD) motor_stop_immediate();
     }
+    ESP_LOGD(TAG, "IR obstacles: front=%d back=%d", (int)front, (int)back);
+#endif
 }
 
-// ================== RELAY PERIPHERAL API ==================
+/* ─── relay peripherals ───────────────────────────────────── */
 
 void pump_set(bool on)
 {
     s_pump_on = on;
     relay_write(PIN_RELAY_PUMP, on);
-    ESP_LOGI(TAG, "Water pump: %s", on ? "ON" : "OFF");
+    ESP_LOGI(TAG, "Pump: %s", on ? "ON" : "OFF");
 }
 bool pump_get(void) { return s_pump_on; }
 
@@ -263,21 +279,34 @@ void blower_set(bool on)
 {
     s_blower_on = on;
     relay_write(PIN_RELAY_BLOWER, on);
-    ESP_LOGI(TAG, "Air blower: %s", on ? "ON" : "OFF");
+    ESP_LOGI(TAG, "Blower: %s", on ? "ON" : "OFF");
 }
 bool blower_get(void) { return s_blower_on; }
 
-// ================== AUTO MODE ==================
+/* ─── blocking move ───────────────────────────────────────── */
 
-void motor_move_blocking(motor_dir_t dir, int duration_ms)
+bool motor_move_blocking(motor_dir_t dir, int duration_ms)
 {
     if (s_accident) {
-        ESP_LOGW(TAG, "AUTO MOVE BLOCKED: ACCIDENT");
+        ESP_LOGW(TAG, "Blocking move refused — accident set");
         motor_stop_immediate();
-        return;
+        return false;
     }
     motor_send_cmd(dir);
-    vTaskDelay(pdMS_TO_TICKS(duration_ms));
+
+    const int POLL_MS = 10;
+    int elapsed = 0;
+    while (elapsed < duration_ms) {
+        if (s_accident) {
+            motor_stop_immediate();
+            return false;
+        }
+        int slice = ((duration_ms - elapsed) < POLL_MS)
+                        ? (duration_ms - elapsed) : POLL_MS;
+        vTaskDelay(pdMS_TO_TICKS(slice));
+        elapsed += slice;
+    }
     motor_send_cmd(DIR_STOP);
     vTaskDelay(pdMS_TO_TICKS(MS_STABILISE));
+    return !s_accident;
 }
