@@ -4,8 +4,9 @@ idf_component_register(
         "motor.c"
         "ir_sensor.c"
         "Mpu6050.c"
-        "telegram.c"
+        # "telegram.c"
         "web_server.c"
+        "auto_clean.c"
         "html_page.c"
     INCLUDE_DIRS "."
     REQUIRES

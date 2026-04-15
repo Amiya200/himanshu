@@ -1,13 +1,10 @@
+/*
+ * telegram.h  —  STUB (Telegram alert system removed)
+ *
+ * Kept as empty stub so any old includes compile cleanly.
+ * Do not use — all functions are no-ops.
+ */
 #pragma once
 
-/**
- * @brief Initialize Telegram module (creates send task/queue).
- */
-void telegram_init(void);
-
-/**
- * @brief Enqueue a message to send via Telegram.
- *        Non-blocking — message is copied into an internal queue.
- *        If WiFi is unavailable the message is discarded gracefully.
- */
-void telegram_send(const char *message);
+static inline void telegram_init(void) {}
+static inline void telegram_send(const char *msg) { (void)msg; }

@@ -1,8 +1,12 @@
 /*
  * main.c  —  ESP32 Solar Panel Cleaner  —  application entry point
  *
- * FIX: serial STATUS command now explicitly calls ir_print_status()
- * and prints full MPU data so both sensors are visible in one command.
+ * CHANGES vs original:
+ *  - Accident detection / Telegram system REMOVED entirely
+ *  - accident_monitor_task REMOVED
+ *  - auto_clean module integrated (no inline task here)
+ *  - Serial commands updated: removed ACC/RESET, added AUTO/STOP/GRID
+ *  - Setup log shows rover dimensions and auto-clean config
  */
 
 #include <stdio.h>
@@ -25,7 +29,7 @@
 #include "motor.h"
 #include "ir_sensor.h"
 #include "mpu6050.h"
-#include "telegram.h"
+#include "auto_clean.h"
 #include "web_server.h"
 
 static const char *TAG = "MAIN";
@@ -50,13 +54,11 @@ static void wifi_event_handler(void *arg,
         if (s_sta_retries < STA_MAX_RETRIES) {
             esp_wifi_connect();
             s_sta_retries++;
-            ESP_LOGW(TAG, "WiFi STA reconnect attempt %d/%d",
+            ESP_LOGW(TAG, "WiFi STA reconnect %d/%d",
                      s_sta_retries, (int)STA_MAX_RETRIES);
         } else {
             xEventGroupSetBits(s_wifi_events, WIFI_STA_FAIL_BIT);
-            ESP_LOGE(TAG,
-                     "WiFi STA failed after %d retries -- AP still active",
-                     (int)STA_MAX_RETRIES);
+            ESP_LOGE(TAG, "STA failed -- AP still active");
         }
 
     } else if (base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
@@ -116,51 +118,7 @@ static void wifi_init(void)
     if (bits & WIFI_STA_CONNECTED_BIT) {
         ESP_LOGI(TAG, "STA connected to '%s'", STA_SSID);
     } else {
-        ESP_LOGW(TAG, "STA not connected -- AP '%s' available on 192.168.4.1",
-                 AP_SSID);
-    }
-}
-
-/* ─── Accident monitor task ───────────────────────────────── */
-
-static volatile bool s_telegram_sent = false;
-
-static void accident_monitor_task(void *arg)
-{
-    (void)arg;
-    vTaskDelay(pdMS_TO_TICKS(5000));
-    ESP_LOGI(TAG, "Accident monitor active  vib_thr=%.2fg",
-             (double)MPU_VIB_THRESHOLD_G);
-
-    while (1) {
-        bool acc = motor_get_accident();
-
-        if (acc && !s_telegram_sent) {
-            mpu_data_t d = mpu_get();
-            char msg[512];
-            snprintf(msg, sizeof(msg),
-                     "*EMERGENCY: Accident Detected!*"
-                     "\n\n*Source:* MPU-6050 Vibration"
-                     "\n*Vib deviation:* %.3f g"
-                     "\n*Heading:* %.1f deg"
-                     "\n*Temp:* %d C"
-                     "\n*Location:* %s",
-                     (double)d.vib_mag,
-                     (double)d.heading_deg,
-                     d.temp_c,
-                     CAR_LOCATION);
-            telegram_send(msg);
-            s_telegram_sent = true;
-            gpio_set_level(PIN_TAIL_LIGHT, 1);
-            ESP_LOGW(TAG, "Accident alert sent via Telegram");
-        }
-
-        if (!acc && s_telegram_sent) {
-            s_telegram_sent = false;
-            ESP_LOGI(TAG, "Accident cleared -- Telegram flag reset");
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(200));
+        ESP_LOGW(TAG, "STA not connected -- AP '%s' @ 192.168.4.1", AP_SSID);
     }
 }
 
@@ -171,7 +129,16 @@ static void serial_cmd_task(void *arg)
     (void)arg;
     char buf[64];
     int  pos = 0;
-    ESP_LOGI(TAG, "Serial commands: ACC | RESET | HDG | STATUS | IR | MPU");
+
+    ESP_LOGI(TAG, "Serial commands:");
+    ESP_LOGI(TAG, "  AUTO    -- start auto-clean");
+    ESP_LOGI(TAG, "  STOP    -- stop auto-clean");
+    ESP_LOGI(TAG, "  STATUS  -- full system status");
+    ESP_LOGI(TAG, "  IR      -- IR sensor status");
+    ESP_LOGI(TAG, "  MPU     -- MPU-6050 status");
+    ESP_LOGI(TAG, "  HDG     -- current gyro heading");
+    ESP_LOGI(TAG, "  HDGRST  -- reset heading to 0");
+    ESP_LOGI(TAG, "  GRID    -- show current grid config");
 
     while (1) {
         int c = fgetc(stdin);
@@ -185,107 +152,117 @@ static void serial_cmd_task(void *arg)
             for (int i = 0; buf[i]; i++)
                 buf[i] = (char)toupper((unsigned char)buf[i]);
 
-            if (strcmp(buf, "ACC") == 0) {
-                motor_set_accident(true);
-                ESP_LOGI(TAG, "[SERIAL] ACC -- accident simulated");
+            /* ── AUTO ── */
+            if (strcmp(buf, "AUTO") == 0) {
+                if (auto_clean_is_running()) {
+                    ESP_LOGW(TAG, "[SERIAL] AUTO -- already running");
+                } else if (auto_clean_start()) {
+                    ESP_LOGI(TAG, "[SERIAL] AUTO -- started");
+                } else {
+                    ESP_LOGE(TAG, "[SERIAL] AUTO -- failed to start");
+                }
 
-            } else if (strcmp(buf, "RESET") == 0) {
-                motor_set_accident(false);
-                mpu_clear_accident();
-                s_telegram_sent = false;
-                gpio_set_level(PIN_TAIL_LIGHT, 0);
-                ESP_LOGI(TAG, "[SERIAL] RESET -- accident cleared");
+            /* ── STOP ── */
+            } else if (strcmp(buf, "STOP") == 0) {
+                auto_clean_stop();
+                ESP_LOGI(TAG, "[SERIAL] STOP -- stop requested");
 
+            /* ── HDG ── */
             } else if (strcmp(buf, "HDG") == 0) {
                 ESP_LOGI(TAG, "[SERIAL] Heading=%.1f deg",
                          (double)mpu_heading());
 
+            /* ── HDGRST ── */
+            } else if (strcmp(buf, "HDGRST") == 0) {
+                mpu_reset_heading();
+                ESP_LOGI(TAG, "[SERIAL] Heading reset to 0");
+
+            /* ── IR ── */
             } else if (strcmp(buf, "IR") == 0) {
-                /*
-                 * New dedicated IR command: print raw pin levels AND
-                 * debounced state so wiring can be verified instantly.
-                 */
                 ir_status_t ir = ir_get_status();
-                ESP_LOGI(TAG, "=== IR SENSOR STATUS ===");
+                ESP_LOGI(TAG, "=== IR STATUS ===");
                 ESP_LOGI(TAG, "  Front-Left  (pin %d): %s",
                          (int)PIN_IR_FRONT_LEFT,
-                         ir.fl ? "BLOCKED (obstacle)" : "CLEAR");
+                         ir.fl ? "BLOCKED" : "CLEAR");
                 ESP_LOGI(TAG, "  Front-Right (pin %d): %s",
                          (int)PIN_IR_FRONT_RIGHT,
-                         ir.fr ? "BLOCKED (obstacle)" : "CLEAR");
+                         ir.fr ? "BLOCKED" : "CLEAR");
                 ESP_LOGI(TAG, "  Back-Left   (pin %d): %s",
                          (int)PIN_IR_BACK_LEFT,
-                         ir.bl ? "BLOCKED (obstacle)" : "CLEAR");
+                         ir.bl ? "BLOCKED" : "CLEAR");
                 ESP_LOGI(TAG, "  Back-Right  (pin %d): %s",
                          (int)PIN_IR_BACK_RIGHT,
-                         ir.br ? "BLOCKED (obstacle)" : "CLEAR");
+                         ir.br ? "BLOCKED" : "CLEAR");
                 ESP_LOGI(TAG, "  Front zone: %s  |  Back zone: %s",
                          ir.front_blocked ? "BLOCKED" : "CLEAR",
                          ir.back_blocked  ? "BLOCKED" : "CLEAR");
-#if IR_ENABLED
-                ESP_LOGI(TAG, "  IR_ENABLED=1 (active)");
-#else
-                ESP_LOGW(TAG, "  IR_ENABLED=0 in config.h -- sensors disabled!");
-#endif
 
+            /* ── MPU ── */
             } else if (strcmp(buf, "MPU") == 0) {
-                /*
-                 * New dedicated MPU command: print all MPU fields.
-                 */
                 mpu_data_t d = mpu_get();
-                ESP_LOGI(TAG, "=== MPU-6050 STATUS ===");
-                ESP_LOGI(TAG, "  Ready:     %s", mpu_is_ready() ? "YES" : "NO (check wiring)");
-                ESP_LOGI(TAG, "  Accel X:   %.4f g", (double)d.accel_x);
-                ESP_LOGI(TAG, "  Accel Y:   %.4f g", (double)d.accel_y);
-                ESP_LOGI(TAG, "  Accel Z:   %.4f g  (expect ~1.0 on flat surface)",
+                ESP_LOGI(TAG, "=== MPU STATUS ===");
+                ESP_LOGI(TAG, "  Ready:   %s", mpu_is_ready() ? "YES" : "NO");
+                ESP_LOGI(TAG, "  Accel X: %.4f g", (double)d.accel_x);
+                ESP_LOGI(TAG, "  Accel Y: %.4f g", (double)d.accel_y);
+                ESP_LOGI(TAG, "  Accel Z: %.4f g (expect ~1.0 flat)",
                          (double)d.accel_z);
-                ESP_LOGI(TAG, "  Gyro Z:    %.4f deg/s", (double)d.gyro_z);
-                ESP_LOGI(TAG, "  Heading:   %.1f deg", (double)d.heading_deg);
-                ESP_LOGI(TAG, "  Vibration: %.4f g  (threshold=%.2f)",
-                         (double)d.vib_mag, (double)MPU_VIB_THRESHOLD_G);
-                ESP_LOGI(TAG, "  Temp:      %d C", d.temp_c);
-                ESP_LOGI(TAG, "  Accident:  %d", (int)d.accident);
+                ESP_LOGI(TAG, "  Gyro Z:  %.4f deg/s", (double)d.gyro_z);
+                ESP_LOGI(TAG, "  Heading: %.1f deg", (double)d.heading_deg);
+                ESP_LOGI(TAG, "  Vib:     %.4f g", (double)d.vib_mag);
+                ESP_LOGI(TAG, "  Temp:    %d C", d.temp_c);
 
+            /* ── STATUS ── */
             } else if (strcmp(buf, "STATUS") == 0) {
-                /*
-                 * Full combined status: motor + IR + MPU.
-                 */
-                mpu_data_t d   = mpu_get();
+                mpu_data_t  d  = mpu_get();
                 ir_status_t ir = ir_get_status();
+                clean_grid_t g;
+                auto_clean_get_grid(&g);
 
                 ESP_LOGI(TAG, "=== FULL SYSTEM STATUS ===");
-
-                /* Motor */
-                ESP_LOGI(TAG, "  [MOTOR] dir=%s  accident=%d  ramming=%d  "
-                         "pump=%d  blower=%d",
+                ESP_LOGI(TAG, "  [MOTOR] dir=%s  pump=%d  blower=%d",
                          motor_dir_to_str(motor_get_direction()),
-                         (int)motor_get_accident(),
-                         (int)motor_get_ramming(),
-                         (int)pump_get(),
-                         (int)blower_get());
-
-                /* IR */
+                         (int)pump_get(), (int)blower_get());
 #if IR_ENABLED
-                ESP_LOGI(TAG, "  [IR]    FL=%d FR=%d BL=%d BR=%d  "
-                         "F_blocked=%d B_blocked=%d",
+                ESP_LOGI(TAG, "  [IR]    FL=%d FR=%d BL=%d BR=%d  F=%d B=%d",
                          (int)ir.fl, (int)ir.fr,
                          (int)ir.bl, (int)ir.br,
                          (int)ir.front_blocked, (int)ir.back_blocked);
 #else
-                ESP_LOGW(TAG, "  [IR]    DISABLED (IR_ENABLED=0 in config.h)");
+                ESP_LOGW(TAG, "  [IR]    DISABLED");
 #endif
-
-                /* MPU */
-                ESP_LOGI(TAG, "  [MPU]   ready=%d  Ax=%.3f Ay=%.3f Az=%.3f g  "
-                         "Gz=%.2f deg/s  hdg=%.1f  vib=%.3f g  temp=%d C",
+                ESP_LOGI(TAG,
+                         "  [MPU]   ready=%d Ax=%.3f Ay=%.3f Az=%.3f "
+                         "Gz=%.2f hdg=%.1f vib=%.3f temp=%d",
                          (int)mpu_is_ready(),
                          (double)d.accel_x, (double)d.accel_y, (double)d.accel_z,
                          (double)d.gyro_z, (double)d.heading_deg,
                          (double)d.vib_mag, d.temp_c);
+                ESP_LOGI(TAG,
+                         "  [AUTO]  state=%d  pct=%d%%  strips=%d/%d",
+                         (int)auto_clean_state(),
+                         auto_clean_pct(),
+                         auto_clean_strips_done(),
+                         auto_clean_strips_total());
+
+            /* ── GRID ── */
+            } else if (strcmp(buf, "GRID") == 0) {
+                clean_grid_t g;
+                auto_clean_get_grid(&g);
+                int strips = (g.panel_w_cm + ROVER_WIDTH_CM - 1) / ROVER_WIDTH_CM;
+                ESP_LOGI(TAG, "=== GRID CONFIG ===");
+                ESP_LOGI(TAG, "  Columns:      %d", g.panel_cols);
+                ESP_LOGI(TAG, "  Rows:         %d", g.panel_rows);
+                ESP_LOGI(TAG, "  Panel W:      %d cm", g.panel_w_cm);
+                ESP_LOGI(TAG, "  Panel H:      %d cm", g.panel_h_cm);
+                ESP_LOGI(TAG, "  Gap:          %d cm", g.gap_between_cm);
+                ESP_LOGI(TAG, "  Wash:         %s", g.wash_enabled ? "YES" : "NO");
+                ESP_LOGI(TAG, "  Blow:         %s", g.blow_enabled ? "YES" : "NO");
+                ESP_LOGI(TAG, "  Strips/panel: %d (rover=%d cm wide)", strips, ROVER_WIDTH_CM);
+                ESP_LOGI(TAG, "  Total strips: %d", strips * g.panel_cols * g.panel_rows);
 
             } else if (strlen(buf) > 0) {
-                ESP_LOGW(TAG, "[SERIAL] Unknown command: '%s'", buf);
-                ESP_LOGI(TAG, "  Available: ACC | RESET | HDG | IR | MPU | STATUS");
+                ESP_LOGW(TAG, "[SERIAL] Unknown: '%s'", buf);
+                ESP_LOGI(TAG, "  Available: AUTO | STOP | STATUS | IR | MPU | HDG | HDGRST | GRID");
             }
         } else {
             buf[pos++] = (char)c;
@@ -299,12 +276,14 @@ static void serial_cmd_task(void *arg)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "========== ESP32 SOLAR CLEANER STARTING ==========");
+    ESP_LOGI(TAG, "========== ESP32 SOLAR CLEANER v2.0 STARTING ==========");
+    ESP_LOGI(TAG, "Rover: %d cm wide x %d cm deep",
+             ROVER_WIDTH_CM, ROVER_DEPTH_CM);
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
         ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_LOGW(TAG, "NVS partition erased and reinitialised");
+        ESP_LOGW(TAG, "NVS erased and reinitialised");
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
@@ -314,22 +293,21 @@ void app_main(void)
     ir_init();
     mpu_init();
     wifi_init();
-    telegram_init();
 
     ret = web_server_start();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Web server failed to start -- continuing without it");
+        ESP_LOGE(TAG, "Web server failed -- continuing without it");
     }
 
-    xTaskCreate(accident_monitor_task, "acc_monitor",
-                3072, NULL, 6, NULL);
-    xTaskCreate(serial_cmd_task,       "serial_cmd",
+    xTaskCreate(serial_cmd_task, "serial_cmd",
                 4096, NULL, 2, NULL);
 
     ESP_LOGI(TAG, "========== SETUP COMPLETE ==========");
     ESP_LOGI(TAG, "AP SSID: %s  -> http://192.168.4.1", AP_SSID);
-    ESP_LOGI(TAG, "MPU ready: %s",
-             mpu_is_ready() ? "YES" : "NO (check wiring)");
-    ESP_LOGI(TAG, "IR enabled: %s",
-             IR_ENABLED ? "YES" : "NO (IR_ENABLED=0 in config.h)");
+    ESP_LOGI(TAG, "MPU ready:  %s", mpu_is_ready() ? "YES" : "NO (check wiring)");
+    ESP_LOGI(TAG, "IR enabled: %s", IR_ENABLED ? "YES" : "NO");
+    ESP_LOGI(TAG, "Clean pattern: boustrophedon (snake across panel width)");
+    ESP_LOGI(TAG, "  FORWARD = panel top -> bottom (cleaning)");
+    ESP_LOGI(TAG, "  BACKWARD = panel bottom -> top (rewind only)");
+    ESP_LOGI(TAG, "Place rover at TOP-LEFT of first panel, facing DOWN, then press AUTO CLEAN");
 }

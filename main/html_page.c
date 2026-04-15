@@ -2,15 +2,14 @@
  * html_page.c  —  ESP32 Solar Panel Cleaner dashboard HTML
  *
  * CHANGES vs original:
- *  - Removed all references to front_dist / back_dist (IR sensors are
- *    digital, not ultrasonic — those fields never existed in /status)
- *  - Added full 4-channel IR sensor grid with live state indicators
- *  - Added MPU-6050 panel: ready flag, temp, heading compass, tilt bubble,
- *    accel X/Y/Z bars, vibration meter
- *  - Added /sensor_check diagnostic panel (wiring verification)
- *  - Replaced browser alert() popups with non-blocking toast notifications
- *  - Auto-clean panel shows running state with stop button
- *  - All sensor data now correctly reflects what /status actually returns
+ *  - All accident detection UI removed (banner, reset button, alert)
+ *  - Auto-clean section: real-time progress bar, strip counter,
+ *    percentage display, state label
+ *  - Cleaning pattern diagram shown in grid editor
+ *  - /status JSON now uses auto_pct / auto_strips_done / auto_strips_total
+ *  - Manual drive locked out while auto-clean is running
+ *  - Grid editor shows calculated strips_per_panel and est. time
+ *  - Sensor check panel updated (rover dimensions shown)
  */
 
 #include "html_page.h"
@@ -38,15 +37,12 @@ static const char HTML_PAGE[] =
 "repeating-linear-gradient(0deg,transparent,transparent 39px,rgba(0,210,120,0.025) 40px),"
 "repeating-linear-gradient(90deg,transparent,transparent 39px,rgba(0,210,120,0.025) 40px);}"
 
-/* ── header ── */
 "header{padding:10px 16px;background:rgba(0,0,0,0.85);border-bottom:1px solid var(--border);"
 "display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:30;"
 "backdrop-filter:blur(12px);}"
 "header h1{font-size:15px;font-weight:900;letter-spacing:3px;color:var(--accent);text-shadow:0 0 14px rgba(0,212,120,0.6);}"
 "header small{font-family:'Share Tech Mono';font-size:9px;color:var(--dim);}"
-"#pingBar{height:3px;background:transparent;transition:background 0.3s;}"
 
-/* ── toasts (replaces alert()) ── */
 "#toastContainer{position:fixed;top:60px;right:12px;z-index:999;display:flex;flex-direction:column;gap:6px;pointer-events:none;}"
 ".toast{padding:8px 14px;border-radius:8px;font-family:'Share Tech Mono';font-size:11px;letter-spacing:1px;"
 "border:1px solid;animation:toastIn 0.2s ease,toastOut 0.3s ease 3.7s forwards;pointer-events:none;}"
@@ -56,16 +52,10 @@ static const char HTML_PAGE[] =
 "@keyframes toastIn{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:none}}"
 "@keyframes toastOut{from{opacity:1}to{opacity:0}}"
 
-/* ── alert banners ── */
-"#alertBanner{display:none;margin:0 10px 8px;padding:10px 14px;border-radius:8px;"
-"background:rgba(255,75,43,0.15);border:1px solid rgba(255,75,43,0.6);color:var(--accent2);"
-"font-weight:700;font-size:12px;letter-spacing:1px;text-align:center;animation:blink 0.7s infinite;}"
 "#obsBanner{display:none;margin:0 10px 8px;padding:8px 14px;border-radius:8px;"
 "background:rgba(255,204,0,0.1);border:1px solid rgba(255,204,0,0.4);"
 "color:var(--warn);font-weight:700;font-size:11px;text-align:center;}"
-"@keyframes blink{0%,100%{opacity:1}50%{opacity:0.3}}"
 
-/* ── layout grid ── */
 ".grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:10px;max-width:1100px;margin:0 auto;}"
 "@media(max-width:640px){.grid{grid-template-columns:1fr;}}"
 ".panel{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px;"
@@ -74,17 +64,15 @@ static const char HTML_PAGE[] =
 "margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--border);}"
 ".full{grid-column:1/-1;}"
 
-/* ── status items ── */
 ".si{display:flex;justify-content:space-between;align-items:center;padding:4px 0;"
 "border-bottom:1px solid rgba(255,255,255,0.04);font-size:11px;}"
 ".si:last-child{border-bottom:none;}"
 ".sk{color:var(--dim);font-size:9px;letter-spacing:1px;text-transform:uppercase;font-family:'Share Tech Mono';}"
 ".sv{font-family:'Share Tech Mono';font-size:11px;}"
 ".ok{color:var(--accent);}.warn2{color:var(--warn);font-weight:700;}"
-".err{color:var(--accent2);font-weight:700;animation:blink 0.7s infinite;}"
 ".pump-on{color:var(--pump);font-weight:700;}.blow-on{color:var(--blow);font-weight:700;}"
 
-/* ── IR sensor grid ── */
+/* IR grid */
 ".ir-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:4px;}"
 ".ir-cell{border:1px solid var(--border);border-radius:8px;padding:10px 8px;text-align:center;transition:all 0.2s;}"
 ".ir-cell .ic-label{font-size:8px;color:var(--dim);letter-spacing:2px;margin-bottom:6px;}"
@@ -100,7 +88,7 @@ static const char HTML_PAGE[] =
 ".ir-zone .iz-label{color:var(--dim);letter-spacing:1px;margin-bottom:3px;}"
 ".ir-zone .iz-val{font-size:12px;font-weight:700;}"
 
-/* ── MPU panel ── */
+/* MPU */
 ".mpu-ready-badge{display:inline-block;padding:3px 10px;border-radius:12px;font-size:9px;letter-spacing:2px;margin-bottom:10px;}"
 ".mpu-ready-badge.ok{background:rgba(0,212,120,0.15);border:1px solid rgba(0,212,120,0.4);color:var(--accent);}"
 ".mpu-ready-badge.fail{background:rgba(255,75,43,0.15);border:1px solid rgba(255,75,43,0.4);color:var(--accent2);}"
@@ -123,7 +111,7 @@ static const char HTML_PAGE[] =
 "background:var(--accent);transform:translate(-50%,-50%);box-shadow:0 0 6px var(--accent);}"
 ".compass-hdg{font-family:'Share Tech Mono';font-size:11px;color:var(--accent);}"
 
-/* tilt bubble */
+/* tilt */
 ".tilt-wrap{display:flex;flex-direction:column;align-items:center;gap:4px;}"
 ".tilt-plate{position:relative;width:80px;height:80px;border-radius:50%;"
 "background:radial-gradient(circle,#0a1420 0,#050a10 100%);"
@@ -149,11 +137,10 @@ static const char HTML_PAGE[] =
 ".ab-fill.az{background:rgba(0,170,255,0.7);}"
 ".ab-val{font-family:'Share Tech Mono';font-size:9px;color:var(--text);width:42px;text-align:right;}"
 
-/* vibration meter */
+/* vib */
 ".vib-meter{margin-top:8px;}"
 ".vib-track{height:10px;background:rgba(255,255,255,0.05);border-radius:5px;overflow:hidden;}"
 ".vib-fill{height:100%;border-radius:5px;transition:width 0.2s,background 0.2s;background:var(--accent);}"
-".vib-fill.danger{background:var(--accent2);}"
 ".vib-labels{display:flex;justify-content:space-between;font-family:'Share Tech Mono';font-size:8px;color:var(--dim);margin-top:2px;}"
 
 /* buttons */
@@ -162,6 +149,7 @@ static const char HTML_PAGE[] =
 "cursor:pointer;transition:all 0.12s;text-transform:uppercase;user-select:none;"
 "touch-action:manipulation;background:rgba(255,255,255,0.04);color:var(--text);}"
 ".btn:active{transform:scale(0.95);}"
+".btn:disabled,.btn.disabled{opacity:0.35;cursor:not-allowed;}"
 ".btn.dir{background:rgba(0,212,120,0.08);color:var(--accent);border-color:rgba(0,212,120,0.25);}"
 ".btn.stop-btn{background:rgba(255,75,43,0.1);color:var(--accent2);border-color:rgba(255,75,43,0.35);}"
 ".btn.tail{background:rgba(255,204,0,0.08);color:var(--warn);border-color:rgba(255,204,0,0.25);}"
@@ -206,19 +194,25 @@ static const char HTML_PAGE[] =
 ".ll{height:18px;white-space:pre;overflow:hidden;}"
 ".ld{border-top:1px solid #1a3a1a;margin:3px 0;}"
 
-/* ping */
 "#pingDot{width:8px;height:8px;border-radius:50%;background:#444;display:inline-block;margin-left:6px;transition:background 0.3s;}"
 "#pingDot.ok{background:var(--accent);box-shadow:0 0 6px var(--accent);}"
 "#pingDot.err{background:var(--accent2);}"
 
-/* auto status */
-".auto-status{margin-top:8px;padding:8px 10px;border-radius:6px;font-family:'Share Tech Mono';"
-"font-size:10px;text-align:center;border:1px solid;}"
-".auto-status.idle{color:var(--dim);border-color:rgba(255,255,255,0.06);background:rgba(0,0,0,0.2);}"
-".auto-status.running{color:var(--accent);border-color:rgba(0,212,120,0.4);background:rgba(0,212,120,0.08);"
-"animation:blink 1.2s infinite;}"
+/* auto clean progress */
+".auto-box{margin-top:10px;padding:12px;border-radius:8px;border:1px solid var(--border);"
+"background:rgba(0,0,0,0.3);}"
+".auto-state-label{font-size:10px;font-weight:700;letter-spacing:3px;margin-bottom:8px;}"
+".auto-state-label.idle{color:var(--dim);}"
+".auto-state-label.running{color:var(--accent);animation:blink 1.2s infinite;}"
+".auto-state-label.done{color:var(--accent3);}"
+".auto-state-label.error{color:var(--accent2);}"
+"@keyframes blink{0%,100%{opacity:1}50%{opacity:0.3}}"
+".progress-track{height:12px;background:rgba(255,255,255,0.05);border-radius:6px;overflow:hidden;margin:6px 0;}"
+".progress-fill{height:100%;border-radius:6px;background:linear-gradient(90deg,#00a058,#00d478);"
+"transition:width 0.5s ease;}"
+".progress-labels{display:flex;justify-content:space-between;font-family:'Share Tech Mono';font-size:9px;color:var(--dim);}"
 
-/* sensor check panel */
+/* sensor check */
 ".chk-table{width:100%;border-collapse:collapse;font-family:'Share Tech Mono';font-size:10px;margin-top:8px;}"
 ".chk-table th{color:var(--dim);font-size:8px;letter-spacing:2px;text-align:left;padding:3px 6px;"
 "border-bottom:1px solid var(--border);}"
@@ -227,7 +221,7 @@ static const char HTML_PAGE[] =
 
 /* grid editor */
 ".ge-row{display:flex;align-items:center;gap:8px;margin:5px 0;}"
-".ge-label{font-family:'Share Tech Mono';font-size:9px;color:var(--dim);width:90px;letter-spacing:1px;}"
+".ge-label{font-family:'Share Tech Mono';font-size:9px;color:var(--dim);width:110px;letter-spacing:1px;}"
 ".ge-input{flex:1;background:rgba(0,0,0,0.5);border:1px solid var(--border);border-radius:4px;"
 "color:var(--accent);font-family:'Share Tech Mono';font-size:12px;padding:4px 8px;text-align:center;}"
 ".ge-input:focus{outline:none;border-color:var(--accent);}"
@@ -236,6 +230,8 @@ static const char HTML_PAGE[] =
 "#gridPreview{margin-top:10px;padding:8px;background:rgba(0,0,0,0.4);"
 "border:1px solid rgba(0,212,120,0.12);border-radius:6px;display:flex;justify-content:center;}"
 ".brow{display:flex;flex-wrap:wrap;gap:4px;margin-top:8px;}"
+".info-chip{display:inline-block;padding:3px 8px;border-radius:10px;font-family:'Share Tech Mono';"
+"font-size:9px;background:rgba(0,170,255,0.1);border:1px solid rgba(0,170,255,0.25);color:var(--accent3);margin:2px;}"
 "</style>"
 "</head>"
 "<body>"
@@ -245,15 +241,17 @@ static const char HTML_PAGE[] =
 "<div><h1>&#9728; SOLAR CLEANER <span id='pingDot'></span></h1></div>"
 "<small>AP: SolarCleaner &nbsp;|&nbsp; 192.168.4.1</small>"
 "</header>"
-"<div id='pingBar'></div>"
-"<div id='alertBanner'>&#9888; ACCIDENT DETECTED &mdash; MOVEMENT BLOCKED</div>"
 "<div id='obsBanner'>&#128680; OBSTACLE DETECTED &mdash; PATH BLOCKED</div>"
 
 "<div class='grid'>"
 
-/* ══════════════ JOYSTICK ══════════════ */
+/* ══ DRIVE PANEL ══ */
 "<div class='panel'>"
 "<h3>&#127918; Manual Drive</h3>"
+"<div id='autoLockMsg' style='display:none;padding:8px;background:rgba(0,212,120,0.1);border:1px solid rgba(0,212,120,0.3);"
+"border-radius:6px;font-family:\"Share Tech Mono\";font-size:9px;color:var(--accent);text-align:center;margin-bottom:8px;'>"
+"&#9888; AUTO-CLEAN RUNNING &mdash; MANUAL DRIVE LOCKED"
+"</div>"
 "<div class='jw'><div class='joystick' id='joy'><div class='joy-h' id='joyH'></div></div></div>"
 "<div class='jlbl'>DRAG TO DRIVE &bull; RELEASE = STOP</div>"
 "<div class='bgrid'>"
@@ -273,11 +271,11 @@ static const char HTML_PAGE[] =
 "</div>"
 "</div>"
 
-/* ══════════════ IR SENSORS ══════════════ */
+/* ══ IR SENSORS ══ */
 "<div class='panel'>"
 "<h3>&#128064; IR Obstacle Sensors</h3>"
 "<div style='font-size:9px;color:var(--dim);font-family:\"Share Tech Mono\";letter-spacing:1px;margin-bottom:8px;'>"
-"Digital sensors -- LOW = obstacle detected (active-LOW with pull-up)"
+"Digital sensors -- LOW = obstacle (active-LOW with pull-up)"
 "</div>"
 "<div class='ir-grid'>"
 "<div class='ir-cell' id='irFL'><div class='ic-label'>FRONT LEFT</div><div class='ic-dot'></div><div class='ic-state' id='irFLst'>---</div></div>"
@@ -296,7 +294,7 @@ static const char HTML_PAGE[] =
 "</div>"
 "</div>"
 
-/* ══════════════ MPU-6050 ══════════════ */
+/* ══ MPU-6050 ══ */
 "<div class='panel'>"
 "<h3>&#129517; MPU-6050 IMU</h3>"
 "<div id='mpuBadge' class='mpu-ready-badge fail'>NOT DETECTED</div>"
@@ -304,10 +302,8 @@ static const char HTML_PAGE[] =
 "<div class='compass-wrap'>"
 "<div class='compass'>"
 "<div class='compass-ring'></div>"
-"<div class='compass-n'>N</div>"
-"<div class='compass-s'>S</div>"
-"<div class='compass-e'>E</div>"
-"<div class='compass-w'>W</div>"
+"<div class='compass-n'>N</div><div class='compass-s'>S</div>"
+"<div class='compass-e'>E</div><div class='compass-w'>W</div>"
 "<div class='compass-needle' id='cNeedle'></div>"
 "<div class='compass-dot'></div>"
 "</div>"
@@ -316,8 +312,7 @@ static const char HTML_PAGE[] =
 "</div>"
 "<div class='tilt-wrap'>"
 "<div class='tilt-plate'>"
-"<div class='tilt-cross-h'></div>"
-"<div class='tilt-cross-v'></div>"
+"<div class='tilt-cross-h'></div><div class='tilt-cross-v'></div>"
 "<div class='tilt-ring'></div>"
 "<div class='tilt-bubble' id='tBubble'></div>"
 "</div>"
@@ -334,83 +329,103 @@ static const char HTML_PAGE[] =
 "<div style='display:flex;justify-content:space-between;font-size:8px;font-family:\"Share Tech Mono\";color:var(--dim);margin-bottom:3px;'>"
 "<span>VIBRATION</span><span id='vibVal'>0.000 g</span></div>"
 "<div class='vib-track'><div class='vib-fill' id='vibFill' style='width:0'></div></div>"
-"<div class='vib-labels'><span>0</span><span>THR</span><span>2g</span></div>"
+"<div class='vib-labels'><span>0</span><span>0.5g</span><span>2g</span></div>"
 "</div>"
 "<div class='si' style='margin-top:8px'><span class='sk'>Temp</span><span class='sv' id='mpuTemp'>---</span></div>"
 "</div>"
 
-/* ══════════════ STATUS ══════════════ */
+/* ══ STATUS ══ */
 "<div class='panel'>"
 "<h3>&#128202; System Status</h3>"
 "<div class='si'><span class='sk'>Direction</span><span class='sv' id='sDir'>&mdash;</span></div>"
+"<div class='si'><span class='sk'>Heading</span><span class='sv' id='sHdg'>&mdash;</span></div>"
 "<div class='si'><span class='sk'>Tail Light</span><span class='sv' id='sTail'>&mdash;</span></div>"
-"<div class='si'><span class='sk'>Accident</span><span class='sv' id='sAcc'>&mdash;</span></div>"
 "<div class='si'><span class='sk'>Vibration</span><span class='sv' id='sVib'>&mdash;</span></div>"
 "<div class='si'><span class='sk'>Front Blocked</span><span class='sv' id='sFObs'>&mdash;</span></div>"
 "<div class='si'><span class='sk'>Back Blocked</span><span class='sv' id='sBObs'>&mdash;</span></div>"
 "<div class='si'><span class='sk'>Water Pump</span><span class='sv' id='sPumpSt'>&mdash;</span></div>"
 "<div class='si'><span class='sk'>Air Blower</span><span class='sv' id='sBlowSt'>&mdash;</span></div>"
-"<div class='si'><span class='sk'>Auto Clean</span><span class='sv' id='sAutoSt'>&mdash;</span></div>"
+"<div class='si'><span class='sk'>Auto State</span><span class='sv' id='sAutoSt'>&mdash;</span></div>"
 "<div class='si'><span class='sk'>Ping</span><span class='sv' id='sPing'>&mdash;</span></div>"
 "<div style='margin-top:10px;padding-top:10px;border-top:1px solid var(--border);'>"
-"<div style='font-size:9px;color:var(--dim);letter-spacing:2px;margin-bottom:8px;font-family:\"Share Tech Mono\"'>SAFETY</div>"
+"<div style='font-size:9px;color:var(--dim);letter-spacing:2px;margin-bottom:8px;font-family:\"Share Tech Mono\"'>CONTROLS</div>"
 "<div class='brow'>"
 "<button class='btn tail' onclick=\"setTail(1)\">TAIL ON</button>"
 "<button class='btn tail' onclick=\"setTail(0)\">TAIL OFF</button>"
-"<button class='btn rst'  onclick='resetAcc()'>RESET ACCIDENT</button>"
 "</div>"
 "<button class='btn' id='bRAM' onclick='toggleRam()' style='width:100%;margin-top:8px;background:rgba(255,51,0,0.08);color:#ff4400;border-color:rgba(255,51,0,0.3);'>&#128165; RAMMING: OFF</button>"
 "</div>"
 "</div>"
 
-/* ══════════════ SENSOR DIAGNOSTIC ══════════════ */
+/* ══ SENSOR DIAGNOSTIC ══ */
 "<div class='panel'>"
 "<h3>&#128295; Sensor Wiring Check</h3>"
 "<div style='font-size:9px;color:var(--dim);font-family:\"Share Tech Mono\";line-height:1.6;'>"
-"Verify all sensors are connected. IR: clear area = CLEAR expected.<br>"
-"MPU: flat surface = Ax~0 Ay~0 Az~1.0 expected."
+"IR: clear area = CLEAR expected.<br>"
+"MPU: flat surface = Ax~0 Ay~0 Az~1.0<br>"
+"Rover: <span id='roverDims' style='color:var(--accent3)'>---</span>"
 "</div>"
 "<button class='btn chk-btn' onclick='runSensorCheck()'>&#9654; RUN SENSOR CHECK</button>"
 "<div id='chkResult' style='margin-top:8px;'></div>"
 "</div>"
 
-/* ══════════════ GRID EDITOR (full width) ══════════════ */
+/* ══ GRID EDITOR (full width) ══ */
 "<div class='panel full'>"
 "<h3>&#9728; Solar Panel Grid &amp; Auto Clean</h3>"
 "<div style='display:grid;grid-template-columns:1fr 1fr;gap:16px;'>"
 "<div>"
-"<div style='font-size:9px;color:var(--dim);letter-spacing:2px;margin-bottom:8px;font-family:\"Share Tech Mono\"'>LAYOUT</div>"
+"<div style='font-size:9px;color:var(--dim);letter-spacing:2px;margin-bottom:8px;font-family:\"Share Tech Mono\"'>PANEL LAYOUT</div>"
 "<div class='ge-row'><span class='ge-label'>COLUMNS</span><input class='ge-input' type='number' id='gCols' value='2' min='1' max='10'></div>"
-"<div class='ge-row'><span class='ge-label'>ROWS</span><input class='ge-input' type='number' id='gRows' value='2' min='1' max='10'></div>"
-"<div class='ge-row'><span class='ge-label'>PANEL W (cm)</span><input class='ge-input' type='number' id='gPW' value='100' min='10' max='400'></div>"
-"<div class='ge-row'><span class='ge-label'>PANEL H (cm)</span><input class='ge-input' type='number' id='gPH' value='170' min='10' max='400'></div>"
-"<div class='ge-row'><span class='ge-label'>GAP (cm)</span><input class='ge-input' type='number' id='gGap' value='5' min='0' max='100'></div>"
+"<div class='ge-row'><span class='ge-label'>ROWS</span><input class='ge-input' type='number' id='gRows' value='1' min='1' max='10'></div>"
+"<div class='ge-row'><span class='ge-label'>PANEL WIDTH (cm)</span><input class='ge-input' type='number' id='gPW' value='200' min='20' max='600'></div>"
+"<div class='ge-row'><span class='ge-label'>PANEL HEIGHT (cm)</span><input class='ge-input' type='number' id='gPH' value='170' min='20' max='600'></div>"
+"<div class='ge-row'><span class='ge-label'>GAP BETWEEN (cm)</span><input class='ge-input' type='number' id='gGap' value='5' min='0' max='200'></div>"
 "<div style='margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;'>"
 "<label class='ge-check'><input type='checkbox' id='gWash' checked> &#128166; Pump during clean</label>"
 "<label class='ge-check'><input type='checkbox' id='gBlow'> &#127756; Blower during clean</label>"
 "</div>"
+"<div id='calcInfo' style='margin-top:10px;padding:8px;background:rgba(0,170,255,0.05);"
+"border:1px solid rgba(0,170,255,0.15);border-radius:6px;font-family:\"Share Tech Mono\";font-size:9px;'></div>"
 "<div style='display:flex;gap:6px;margin-top:10px;'>"
 "<button class='btn rst' onclick='saveGrid()' style='flex:1'>SAVE GRID</button>"
 "</div>"
 "<div id='gridMsg' style='font-family:\"Share Tech Mono\";font-size:9px;color:var(--accent);margin-top:6px;min-height:14px;'></div>"
+
+/* auto clean progress */
+"<div class='auto-box'>"
+"<div class='auto-state-label idle' id='autoStateLabel'>IDLE &mdash; READY TO CLEAN</div>"
+"<div class='progress-track'><div class='progress-fill' id='progressFill' style='width:0'></div></div>"
+"<div class='progress-labels'>"
+"<span id='stripsDone'>0 strips done</span>"
+"<span id='progressPct'>0%</span>"
+"<span id='stripsTotal'>/ 0 total</span>"
+"</div>"
+"</div>"
 "<button class='btn auto-btn' id='startAutoBtn' onclick='startAuto()'>&#9654; START AUTO CLEAN</button>"
 "<button class='btn stop-auto' id='stopAutoBtn' onclick='stopAuto()' style='display:none'>&#9632; STOP AUTO CLEAN</button>"
-"<div class='auto-status idle' id='autoStatusBox'>IDLE -- READY TO CLEAN</div>"
 "</div>"
+
 "<div>"
-"<div style='font-size:9px;color:var(--dim);letter-spacing:2px;margin-bottom:8px;font-family:\"Share Tech Mono\"'>PREVIEW</div>"
+"<div style='font-size:9px;color:var(--dim);letter-spacing:2px;margin-bottom:8px;font-family:\"Share Tech Mono\"'>PATTERN PREVIEW</div>"
 "<div id='gridPreview'><canvas id='gpCanvas' width='280' height='200'></canvas></div>"
 "<div id='gpInfo' style='font-family:\"Share Tech Mono\";font-size:9px;color:var(--dim);margin-top:6px;line-height:1.6;'></div>"
+"<div style='margin-top:8px;padding:8px;background:rgba(0,0,0,0.3);border-radius:6px;"
+"font-family:\"Share Tech Mono\";font-size:8px;color:var(--dim);line-height:1.8;'>"
+"<div style='color:var(--accent);font-size:9px;margin-bottom:4px;'>PATTERN LEGEND</div>"
+"<div>&#9660; Green arrows = FORWARD sweep (pump+blower ON)</div>"
+"<div>&#9650; Grey arrows  = BACKWARD rewind (blower OFF)</div>"
+"<div>&#9658; Blue arrow   = lateral shift (between strips)</div>"
+"<div>&#9733; Yellow dot   = start position (top-left)</div>"
+"</div>"
 "</div>"
 "</div>"
 "</div>"
 
-"</div>" /* end .grid */
+"</div>"
 
-/* ══════════════════════ JAVASCRIPT ══════════════════════════ */
+/* ══════ JAVASCRIPT ══════ */
 "<script>"
 
-/* ── Toast notifications ── */
 "function toast(msg,type){"
 "  var c=document.getElementById('toastContainer');"
 "  var t=document.createElement('div');"
@@ -420,13 +435,13 @@ static const char HTML_PAGE[] =
 "  setTimeout(function(){if(t.parentNode)t.parentNode.removeChild(t);},4200);"
 "}"
 
-/* ── State ── */
-"var lastAcc=0,lastFB=0,lastBB=0,ramOn=0,pumpOn=0,blowOn=0;"
+"var lastFB=0,lastBB=0,ramOn=0,pumpOn=0,blowOn=0;"
 "var lastCmd='',inFlight=0,pendingCmd=null;"
-"var autoRunning=false;"
+"var autoRunning=false,lastAutoRunning=false;"
 
-/* ── Move ── */
+/* Move */
 "function mv(dir){"
+"  if(autoRunning)return;" /* locked during auto */
 "  if(dir===lastCmd&&dir!=='stop')return;"
 "  if(inFlight>0){pendingCmd=dir;return;}"
 "  sendMove(dir);"
@@ -435,7 +450,9 @@ static const char HTML_PAGE[] =
 "  lastCmd=dir;inFlight++;hiBtn(dir);"
 "  fetch('/move?dir='+dir,{method:'GET',keepalive:true})"
 "    .then(function(r){return r.text();})"
-"    .then(function(t){inFlight--;flushPending();if(t==='BLOCKED:ACCIDENT')toast('MOVEMENT BLOCKED: Accident flag set','err');})"
+"    .then(function(t){inFlight--;flushPending();"
+"      if(t==='BLOCKED:AUTO_RUNNING')toast('Manual drive locked: Auto-clean running','warn');"
+"    })"
 "    .catch(function(){inFlight--;flushPending();});"
 "}"
 "function flushPending(){"
@@ -450,9 +467,7 @@ static const char HTML_PAGE[] =
 "}"
 
 "function setTail(s){fetch('/tail?state='+(s?'on':'off')).then(function(r){return r.text();}).then(function(t){toast(t,'ok');}).catch(function(){});}"
-"function resetAcc(){fetch('/reset_accident').then(function(){toast('Accident flag cleared','ok');}).catch(function(){});}"
 
-/* pump / blower */
 "function togglePump(){"
 "  pumpOn=!pumpOn;"
 "  fetch('/pump?state='+(pumpOn?'on':'off')).catch(function(){});"
@@ -473,7 +488,6 @@ static const char HTML_PAGE[] =
 "  if(blowOn){b.classList.add('bon');l.textContent='ON';if(s){s.textContent='ON';s.className='sv blow-on';}}"
 "  else{b.classList.remove('bon');l.textContent='OFF';if(s){s.textContent='OFF';s.className='sv ok';}}"
 "}"
-
 "function toggleRam(){"
 "  ramOn=!ramOn;"
 "  fetch('/ramming?state='+(ramOn?'on':'off')).catch(function(){});"
@@ -485,7 +499,6 @@ static const char HTML_PAGE[] =
 "  else{b.textContent='RAMMING: OFF';b.style.background='rgba(255,51,0,0.08)';b.style.boxShadow='none';}"
 "}"
 
-/* ── IR cell update ── */
 "function setIR(id,stId,blocked){"
 "  var c=document.getElementById(id),s=document.getElementById(stId);"
 "  if(!c||!s)return;"
@@ -493,33 +506,64 @@ static const char HTML_PAGE[] =
 "  s.textContent=blocked?'BLOCKED':'CLEAR';"
 "}"
 
-/* ── MPU helpers ── */
 "function setAccelBar(fillId,valId,v){"
 "  var f=document.getElementById(fillId),vEl=document.getElementById(valId);"
 "  if(!f||!vEl)return;"
-"  var pct=Math.min(50,Math.abs(v)/2*50);" /* +/-2g = full half */
+"  var pct=Math.min(50,Math.abs(v)/2*50);"
 "  if(v>=0){f.style.left='50%';f.style.width=pct+'%';}"
 "  else{f.style.left=(50-pct)+'%';f.style.width=pct+'%';}"
 "  vEl.textContent=(v>=0?'+':'')+v.toFixed(3)+' g';"
 "}"
 
-"function updateCompass(hdg){"
-"  var n=document.getElementById('cNeedle'),h=document.getElementById('cHdg');"
-"  if(n)n.style.transform='rotate('+hdg+'deg)';"
-"  if(h)h.textContent=hdg.toFixed(1)+'\\u00b0';"
+"function updateAutoUI(d){"
+"  var running=!!d.auto_running;"
+"  var pct=d.auto_pct||0;"
+"  var done=d.auto_strips_done||0;"
+"  var total=d.auto_strips_total||0;"
+"  var state=d.auto_state||'IDLE';"
+
+"  document.getElementById('progressFill').style.width=pct+'%';"
+"  document.getElementById('progressPct').textContent=pct+'%';"
+"  document.getElementById('stripsDone').textContent=done+' strips done';"
+"  document.getElementById('stripsTotal').textContent='/ '+total+' total';"
+
+"  var sl=document.getElementById('autoStateLabel');"
+"  var sast=document.getElementById('sAutoSt');"
+"  var sab=document.getElementById('startAutoBtn');"
+"  var sop=document.getElementById('stopAutoBtn');"
+"  var lk=document.getElementById('autoLockMsg');"
+
+"  if(running){"
+"    sl.className='auto-state-label running';"
+"    sl.textContent='CLEANING IN PROGRESS...';"
+"    if(sast){sast.textContent='RUNNING';sast.className='sv ok';}"
+"    if(sab)sab.style.display='none';"
+"    if(sop)sop.style.display='block';"
+"    if(lk)lk.style.display='block';"
+"  }else if(state==='DONE'){"
+"    sl.className='auto-state-label done';"
+"    sl.textContent='CLEANING COMPLETE ✓';"
+"    if(sast){sast.textContent='DONE';sast.className='sv ok';}"
+"    if(sab)sab.style.display='block';"
+"    if(sop)sop.style.display='none';"
+"    if(lk)lk.style.display='none';"
+"  }else{"
+"    sl.className='auto-state-label idle';"
+"    sl.textContent='IDLE \u2014 READY TO CLEAN';"
+"    if(sast){sast.textContent='IDLE';sast.className='sv ok';}"
+"    if(sab)sab.style.display='block';"
+"    if(sop)sop.style.display='none';"
+"    if(lk)lk.style.display='none';"
+"  }"
+
+"  if(!lastAutoRunning&&running)toast('Auto clean started','ok');"
+"  if(lastAutoRunning&&!running&&state==='DONE')toast('Auto clean COMPLETE!','ok');"
+"  if(lastAutoRunning&&!running&&state==='IDLE')toast('Auto clean stopped','warn');"
+"  lastAutoRunning=running;"
+"  autoRunning=running;"
 "}"
 
-"function updateTilt(ax,ay){"
-"  var b=document.getElementById('tBubble');"
-"  if(!b)return;"
-"  var scale=25;" /* map +/-1g to +/-25px offset within 40px radius */
-"  var dx=Math.max(-scale,Math.min(scale,ax*scale));"
-"  var dy=Math.max(-scale,Math.min(scale,-ay*scale));"
-"  b.style.left='calc(50% + '+dx+'px)';"
-"  b.style.top='calc(50% + '+dy+'px)';"
-"}"
-
-/* ── Status poll ── */
+/* Status poll */
 "function pollStatus(){"
 "  var t0=Date.now();"
 "  fetch('/status')"
@@ -528,69 +572,52 @@ static const char HTML_PAGE[] =
 "      var ping=Date.now()-t0;"
 "      document.getElementById('sPing').textContent=ping+' ms';"
 "      document.getElementById('pingDot').className=ping<300?'ok':'err';"
-
-      /* direction */
 "      document.getElementById('sDir').textContent=d.direction;"
-
-      /* accident */
-"      var as=document.getElementById('sAcc');"
-"      if(d.accident){"
-"        as.textContent='DETECTED!';as.className='sv err';"
-"        document.getElementById('alertBanner').style.display='block';"
-"        if(!lastAcc)toast('ACCIDENT DETECTED! Movement blocked.','err');"
-"      }else{"
-"        as.textContent='OK';as.className='sv ok';"
-"        document.getElementById('alertBanner').style.display='none';"
-"      }"
-"      lastAcc=d.accident?1:0;"
-
-      /* tail */
 "      document.getElementById('sTail').textContent=d.tail?'ON':'OFF';"
+"      document.getElementById('sHdg').textContent=(d.heading||0).toFixed(1)+'°';"
 
-      /* IR cells */
 "      setIR('irFL','irFLst',d.ir_fl);"
 "      setIR('irFR','irFRst',d.ir_fr);"
 "      setIR('irBL','irBLst',d.ir_bl);"
 "      setIR('irBR','irBRst',d.ir_br);"
 
-      /* IR zone totals */
 "      var izF=document.getElementById('izF'),izB=document.getElementById('izB');"
 "      if(izF){izF.textContent=d.front_blocked?'BLOCKED':'CLEAR';izF.style.color=d.front_blocked?'var(--bad)':'var(--good)';}"
 "      if(izB){izB.textContent=d.back_blocked?'BLOCKED':'CLEAR';izB.style.color=d.back_blocked?'var(--bad)':'var(--good)';}"
 
-      /* obstacle banners & toasts */
 "      document.getElementById('sFObs').textContent=d.front_blocked?'BLOCKED':'CLEAR';"
-"      document.getElementById('sFObs').className='sv '+(d.front_blocked?'err':'ok');"
+"      document.getElementById('sFObs').className='sv '+(d.front_blocked?'warn2':'ok');"
 "      document.getElementById('sBObs').textContent=d.back_blocked?'BLOCKED':'CLEAR';"
-"      document.getElementById('sBObs').className='sv '+(d.back_blocked?'err':'ok');"
+"      document.getElementById('sBObs').className='sv '+(d.back_blocked?'warn2':'ok');"
 "      var obs=!d.ramming&&(d.front_blocked||d.back_blocked);"
 "      document.getElementById('obsBanner').style.display=obs?'block':'none';"
 "      if(!d.ramming){"
-"        if(!lastFB&&d.front_blocked)toast('FRONT OBSTACLE -- path blocked','warn');"
-"        if(!lastBB&&d.back_blocked)toast('BACK OBSTACLE -- path blocked','warn');"
+"        if(!lastFB&&d.front_blocked)toast('FRONT OBSTACLE','warn');"
+"        if(!lastBB&&d.back_blocked)toast('BACK OBSTACLE','warn');"
 "      }"
 "      lastFB=d.front_blocked?1:0;lastBB=d.back_blocked?1:0;"
 
-      /* MPU */
 "      var mpuBadge=document.getElementById('mpuBadge');"
-"      if(mpuBadge){mpuBadge.textContent=d.mpu_ready?'CONNECTED &#10003;':'NOT DETECTED &#10005;';"
+"      if(mpuBadge){mpuBadge.textContent=d.mpu_ready?'CONNECTED \u2713':'NOT DETECTED \u2717';"
 "        mpuBadge.className='mpu-ready-badge '+(d.mpu_ready?'ok':'fail');}"
-"      updateCompass(d.heading||0);"
-"      updateTilt(d.accel_x||0,d.accel_y||0);"
+"      var n=document.getElementById('cNeedle'),h=document.getElementById('cHdg');"
+"      if(n)n.style.transform='rotate('+(d.heading||0)+'deg)';"
+"      if(h)h.textContent=(d.heading||0).toFixed(1)+'\\u00b0';"
+"      var b=document.getElementById('tBubble');"
+"      if(b){var sc=25,dx=Math.max(-sc,Math.min(sc,(d.accel_x||0)*sc)),"
+"        dy=Math.max(-sc,Math.min(sc,-(d.accel_y||0)*sc));"
+"        b.style.left='calc(50% + '+dx+'px)';b.style.top='calc(50% + '+dy+'px)';}"
 "      setAccelBar('abX','avX',d.accel_x||0);"
 "      setAccelBar('abY','avY',d.accel_y||0);"
 "      setAccelBar('abZ','avZ',d.accel_z||0);"
-      /* vib */
 "      var vib=d.vib||0;"
 "      var vf=document.getElementById('vibFill'),vv=document.getElementById('vibVal');"
-"      var vpct=Math.min(100,vib/2*100);"
-"      if(vf){vf.style.width=vpct+'%';vf.className='vib-fill'+(vib>0.3?' danger':'');}"
+"      if(vf){vf.style.width=Math.min(100,vib/2*100)+'%';}"
 "      if(vv)vv.textContent=vib.toFixed(3)+' g';"
 "      document.getElementById('sVib').textContent=vib.toFixed(3)+' g';"
 "      var mt=document.getElementById('mpuTemp');"
 "      if(mt)mt.textContent=d.mpu_temp+'\\u00b0C';"
 
-      /* peripherals */
 "      if(d.ramming!=(ramOn?1:0)){ramOn=d.ramming?1:0;updateRamUI();}"
 "      if(d.pump!=(pumpOn?1:0)){pumpOn=d.pump?1:0;updatePumpUI();}"
 "      if(d.blower!=(blowOn?1:0)){blowOn=d.blower?1:0;updateBlowUI();}"
@@ -599,28 +626,11 @@ static const char HTML_PAGE[] =
 "      document.getElementById('sBlowSt').textContent=d.blower?'ON':'OFF';"
 "      document.getElementById('sBlowSt').className='sv '+(d.blower?'blow-on':'ok');"
 
-      /* auto clean */
-"      var wasRunning=autoRunning;"
-"      autoRunning=!!d.auto_running;"
-"      var sab=document.getElementById('startAutoBtn'),sop=document.getElementById('stopAutoBtn');"
-"      var box=document.getElementById('autoStatusBox'),sast=document.getElementById('sAutoSt');"
-"      if(autoRunning){"
-"        if(sab)sab.style.display='none';"
-"        if(sop)sop.style.display='block';"
-"        if(box){box.className='auto-status running';box.textContent='CLEANING IN PROGRESS...';}"
-"        if(sast){sast.textContent='RUNNING';sast.className='sv err';}"
-"      }else{"
-"        if(sab)sab.style.display='block';"
-"        if(sop)sop.style.display='none';"
-"        if(box){box.className='auto-status idle';box.textContent='IDLE \u2014 READY TO CLEAN';}"
-"        if(sast){sast.textContent='IDLE';sast.className='sv ok';}"
-"        if(wasRunning)toast('Auto clean finished','ok');"
-"      }"
+"      updateAutoUI(d);"
 
-      /* LCD */
 "      var l1='Dir: '+(d.direction.substring(0,7)).padEnd(7)+(d.ramming?' RAM':'    ');"
 "      var l2;"
-"      if(d.accident)l2='!! ACCIDENT !!  ';"
+"      if(d.auto_running)l2='AUTO:'+d.auto_pct+'%  '+d.auto_strips_done+'/'+d.auto_strips_total;"
 "      else if(d.pump&&d.blower)l2='PUMP+BLOW ACTIVE';"
 "      else if(d.pump)l2='PUMP ON         ';"
 "      else if(d.blower)l2='BLOWER ON       ';"
@@ -635,67 +645,93 @@ static const char HTML_PAGE[] =
 "}"
 "setInterval(pollStatus,500);"
 
-/* ── Sensor Check ── */
+/* Sensor Check */
 "function runSensorCheck(){"
 "  var r=document.getElementById('chkResult');"
 "  r.innerHTML='<div style=\"font-family:Share Tech Mono;font-size:9px;color:var(--dim)\">Checking...</div>';"
 "  fetch('/sensor_check')"
 "    .then(function(res){return res.json();})"
 "    .then(function(d){"
+"      document.getElementById('roverDims').textContent=d.rover_w_cm+'cm × '+d.rover_d_cm+'cm';"
 "      var rows='';"
 "      function row(name,status,note){"
 "        var cls=status==='OK'?'chk-ok':status==='FAIL'?'chk-fail':'chk-na';"
 "        return '<tr><td>'+name+'</td><td class=\"'+cls+'\">'+status+'</td><td style=\"color:var(--dim)\">'+note+'</td></tr>';"
 "      }"
-"      rows+=row('IR Enabled',d.ir_enabled?'OK':'N/A',d.ir_enabled?'IR_ENABLED=1 in config':'IR_ENABLED=0');"
+"      rows+=row('IR',d.ir_enabled?'OK':'N/A',d.ir_enabled?'IR_ENABLED=1':'IR_ENABLED=0');"
 "      if(d.ir_enabled){"
-"        rows+=row('IR Front-Left', d.ir_fl.blocked?'BLOCKED':'CLEAR','Pin '+d.ir_fl.pin);"
-"        rows+=row('IR Front-Right',d.ir_fr.blocked?'BLOCKED':'CLEAR','Pin '+d.ir_fr.pin);"
-"        rows+=row('IR Back-Left',  d.ir_bl.blocked?'BLOCKED':'CLEAR','Pin '+d.ir_bl.pin);"
-"        rows+=row('IR Back-Right', d.ir_br.blocked?'BLOCKED':'CLEAR','Pin '+d.ir_br.pin);"
+"        rows+=row('IR Front-L', d.ir_fl.blocked?'BLOCKED':'CLEAR','Pin '+d.ir_fl.pin);"
+"        rows+=row('IR Front-R',d.ir_fr.blocked?'BLOCKED':'CLEAR','Pin '+d.ir_fr.pin);"
+"        rows+=row('IR Back-L',  d.ir_bl.blocked?'BLOCKED':'CLEAR','Pin '+d.ir_bl.pin);"
+"        rows+=row('IR Back-R', d.ir_br.blocked?'BLOCKED':'CLEAR','Pin '+d.ir_br.pin);"
 "      }"
-"      rows+=row('MPU Enabled',d.mpu_enabled?'OK':'N/A',d.mpu_enabled?'MPU_ENABLED=1 in config':'MPU_ENABLED=0');"
+"      rows+=row('MPU',d.mpu_enabled?'OK':'N/A',d.mpu_enabled?'MPU_ENABLED=1':'MPU_ENABLED=0');"
 "      if(d.mpu_enabled){"
-"        rows+=row('MPU WHO_AM_I',d.mpu_ready?'OK':'FAIL',d.mpu_ready?'Sensor responded':'No response -- check SDA/SCL wiring');"
+"        rows+=row('WHO_AM_I',d.mpu_ready?'OK':'FAIL',d.mpu_ready?'Sensor found':'No response - check SDA/SCL');"
 "        if(d.mpu_ready){"
 "          var azOk=Math.abs(d.mpu_accel_z-1.0)<0.3;"
-"          rows+=row('MPU Accel Z',azOk?'OK':'WARN','Expected ~1.0 g (flat), got '+d.mpu_accel_z.toFixed(3)+' g');"
-"          rows+=row('MPU Temp','OK',d.mpu_temp_c+'\\u00b0C -- MPU is powered and reading');"
+"          rows+=row('Accel Z',azOk?'OK':'WARN','Expected ~1.0g flat, got '+d.mpu_accel_z.toFixed(3)+'g');"
+"          rows+=row('Temp','OK',d.mpu_temp_c+'\\u00b0C');"
 "        }"
 "      }"
 "      r.innerHTML='<table class=\"chk-table\"><thead><tr><th>SENSOR</th><th>STATUS</th><th>DETAIL</th></tr></thead><tbody>'+rows+'</tbody></table>';"
 "    })"
-"    .catch(function(){r.innerHTML='<div style=\"color:var(--bad);font-family:Share Tech Mono;font-size:10px\">Request failed -- check WiFi</div>';});"
+"    .catch(function(){r.innerHTML='<div style=\"color:var(--bad);font-family:Share Tech Mono;font-size:10px\">Request failed</div>';});"
 "}"
 
-/* ── Grid editor ── */
+/* Grid editor */
+"function calcAndDraw(){"
+"  var cols=parseInt(document.getElementById('gCols').value)||1;"
+"  var rows=parseInt(document.getElementById('gRows').value)||1;"
+"  var pw=parseInt(document.getElementById('gPW').value)||200;"
+"  var ph=parseInt(document.getElementById('gPH').value)||170;"
+"  var gap=parseInt(document.getElementById('gGap').value)||5;"
+"  var roverW=58,roverD=51;" /* rover dimensions */
+"  var strips=Math.ceil(pw/roverW);"
+"  var totalStrips=strips*cols*rows;"
+"  var estSweepSec=strips*ph*0.15;" /* ~15 ms/cm */
+"  var estTotalSec=estSweepSec*cols*rows+(strips-1)*ph*0.15*cols*rows;" /* rewind time */
+"  var calcEl=document.getElementById('calcInfo');"
+"  if(calcEl){"
+"    calcEl.innerHTML="
+"      '<span style=\"color:var(--accent3)\">Rover: '+roverW+'cm × '+roverD+'cm</span><br>'"
+"      +'Strips per panel: '+strips+' (each '+roverW+'cm wide)<br>'"
+"      +'Total strips: '+totalStrips+'<br>'"
+"      +'Est. clean time: ~'+Math.round(estTotalSec/60)+' min '+Math.round(estTotalSec%60)+' sec';"
+"  }"
+"  drawGrid({cols:cols,rows:rows,pw:pw,ph:ph,gap:gap});"
+"}"
+
 "function saveGrid(){"
 "  var cols=parseInt(document.getElementById('gCols').value)||2;"
-"  var rows=parseInt(document.getElementById('gRows').value)||2;"
-"  var pw=parseInt(document.getElementById('gPW').value)||100;"
+"  var rows=parseInt(document.getElementById('gRows').value)||1;"
+"  var pw=parseInt(document.getElementById('gPW').value)||200;"
 "  var ph=parseInt(document.getElementById('gPH').value)||170;"
 "  var gap=parseInt(document.getElementById('gGap').value)||5;"
 "  var wash=document.getElementById('gWash').checked?1:0;"
 "  var blow=document.getElementById('gBlow').checked?1:0;"
 "  fetch('/set_grid?cols='+cols+'&rows='+rows+'&pw='+pw+'&ph='+ph+'&gap='+gap+'&wash='+wash+'&blow='+blow)"
 "    .then(function(r){return r.json();})"
-"    .then(function(d){document.getElementById('gridMsg').textContent='Saved: '+d.cols+'\\u00d7'+d.rows+' panels';drawGrid(d);toast('Grid saved','ok');})"
+"    .then(function(d){"
+"      document.getElementById('gridMsg').textContent="
+"        'Saved: '+d.cols+'\\u00d7'+d.rows+' panels, '+d.total_strips+' strips total';"
+"      toast('Grid saved -- '+d.total_strips+' strips','ok');"
+"      drawGrid(d);"
+"    })"
 "    .catch(function(){toast('Save failed','err');});"
 "}"
 
 "function startAuto(){"
-"  if(!confirm('Start automatic cleaning?\\nEnsure robot is at the start position.'))return;"
+"  if(!confirm('Start automatic cleaning?\\n\\nEnsure rover is at TOP-LEFT corner\\nof the first panel, facing DOWN the panel.'))return;"
 "  fetch('/auto')"
 "    .then(function(r){return r.text();})"
 "    .then(function(msg){"
-"      if(msg==='BLOCKED:ACCIDENT'){toast('BLOCKED: Reset accident first','err');return;}"
 "      if(msg==='ALREADY_RUNNING'){toast('Already running','warn');return;}"
-"      toast('Auto clean started','ok');"
+"      if(msg.indexOf('ERROR')===0){toast(msg,'err');return;}"
 "    }).catch(function(){toast('Start failed','err');});"
 "}"
-
 "function stopAuto(){"
-"  fetch('/stop_auto').then(function(){toast('Auto clean stopped','warn');}).catch(function(){});"
+"  fetch('/stop_auto').then(function(){toast('Stop requested','warn');}).catch(function(){});"
 "}"
 
 "function loadGrid(){"
@@ -708,57 +744,87 @@ static const char HTML_PAGE[] =
 "      document.getElementById('gGap').value=d.gap;"
 "      document.getElementById('gWash').checked=d.wash===1;"
 "      document.getElementById('gBlow').checked=d.blow===1;"
-"      drawGrid(d);"
+"      if(d.rover_w_cm)"
+"        document.getElementById('roverDims').textContent=d.rover_w_cm+'cm × '+d.rover_d_cm+'cm';"
+"      calcAndDraw();"
 "    }).catch(function(){});"
 "}"
 
+/* Canvas pattern drawing with arrows showing boustrophedon */
 "function drawGrid(d){"
 "  var canvas=document.getElementById('gpCanvas');"
 "  var ctx=canvas.getContext('2d');"
 "  var W=canvas.width,H=canvas.height;"
 "  ctx.clearRect(0,0,W,H);"
-"  var totalW=d.cols*d.pw+(d.cols-1)*d.gap;"
-"  var totalH=d.rows*d.ph+(d.rows-1)*d.gap;"
+"  var roverW=58;"
+"  var pw=d.pw||d.panel_w_cm||200;"
+"  var ph=d.ph||d.panel_h_cm||170;"
+"  var cols=d.cols||d.panel_cols||1;"
+"  var rows=d.rows||d.panel_rows||1;"
+"  var gap=d.gap||d.gap_between_cm||5;"
+"  var totalW=cols*pw+(cols-1)*gap;"
+"  var totalH=rows*ph+(rows-1)*gap;"
 "  var sc=Math.min((W-20)/totalW,(H-20)/totalH);"
 "  var offX=(W-totalW*sc)/2,offY=(H-totalH*sc)/2;"
-"  for(var r=0;r<d.rows;r++){for(var c=0;c<d.cols;c++){"
-"    var x=offX+(c*(d.pw+d.gap))*sc;"
-"    var y=offY+(r*(d.ph+d.gap))*sc;"
-"    var pw=d.pw*sc,ph=d.ph*sc;"
-"    ctx.fillStyle='rgba(0,80,40,0.4)';ctx.fillRect(x,y,pw,ph);"
-"    ctx.strokeStyle='rgba(0,212,120,0.6)';ctx.lineWidth=1.5;ctx.strokeRect(x,y,pw,ph);"
-"    ctx.strokeStyle='rgba(0,212,120,0.12)';ctx.lineWidth=0.5;"
-"    var cxs=pw/6,cys=ph/10;"
-"    for(var cx2=cxs;cx2<pw;cx2+=cxs){ctx.beginPath();ctx.moveTo(x+cx2,y);ctx.lineTo(x+cx2,y+ph);ctx.stroke();}"
-"    for(var cy2=cys;cy2<ph;cy2+=cys){ctx.beginPath();ctx.moveTo(x,y+cy2);ctx.lineTo(x+pw,y+cy2);ctx.stroke();}"
-"    ctx.fillStyle='rgba(0,212,120,0.7)';"
-"    ctx.font='bold '+(Math.max(8,Math.min(12,pw/8)))+'px Orbitron,monospace';"
-"    ctx.textAlign='center';ctx.textBaseline='middle';"
-"    ctx.fillText((r*d.cols+c+1),x+pw/2,y+ph/2);"
+"  var strips=Math.ceil(pw/roverW);"
+"  var sw=pw/strips;" /* display strip width */
+
+"  for(var r=0;r<rows;r++){for(var c=0;c<cols;c++){"
+"    var px=offX+(c*(pw+gap))*sc;"
+"    var py=offY+(r*(ph+gap))*sc;"
+"    var pws=pw*sc,phs=ph*sc;"
+"    ctx.fillStyle='rgba(0,60,30,0.5)';ctx.fillRect(px,py,pws,phs);"
+"    ctx.strokeStyle='rgba(0,212,120,0.5)';ctx.lineWidth=1.5;ctx.strokeRect(px,py,pws,phs);"
+
+    /* strip dividers */
+"    ctx.strokeStyle='rgba(0,212,120,0.2)';ctx.lineWidth=0.5;ctx.setLineDash([3,3]);"
+"    for(var s=1;s<strips;s++){"
+"      var sx=px+s*sw*sc;"
+"      ctx.beginPath();ctx.moveTo(sx,py);ctx.lineTo(sx,py+phs);ctx.stroke();"
+"    }"
+"    ctx.setLineDash([]);"
+
+    /* draw arrows for each strip */
+"    for(var s=0;s<strips;s++){"
+"      var sx=px+(s+0.5)*sw*sc;"
+"      /* Forward (down) arrow -- green */"
+"      ctx.strokeStyle='rgba(0,212,120,0.8)';ctx.lineWidth=1.5;"
+"      ctx.beginPath();ctx.moveTo(sx,py+phs*0.15);ctx.lineTo(sx,py+phs*0.85);ctx.stroke();"
+"      ctx.beginPath();ctx.moveTo(sx-4,py+phs*0.75);ctx.lineTo(sx,py+phs*0.85);ctx.lineTo(sx+4,py+phs*0.75);ctx.stroke();"
+
+"      if(s<strips-1){"
+"        /* Backward (up) rewind arrow -- grey */"
+"        var rx=sx+sw*sc*0.3;"
+"        ctx.strokeStyle='rgba(120,140,130,0.5)';ctx.lineWidth=1;"
+"        ctx.beginPath();ctx.moveTo(rx,py+phs*0.85);ctx.lineTo(rx,py+phs*0.15);ctx.stroke();"
+"        ctx.beginPath();ctx.moveTo(rx-3,py+phs*0.25);ctx.lineTo(rx,py+phs*0.15);ctx.lineTo(rx+3,py+phs*0.25);ctx.stroke();"
+"        /* Lateral shift arrow -- blue */"
+"        ctx.strokeStyle='rgba(0,170,255,0.6)';ctx.lineWidth=1;"
+"        var lsx=px+s*sw*sc,lex=px+(s+1)*sw*sc;"
+"        ctx.beginPath();ctx.moveTo(lsx,py+4);ctx.lineTo(lex,py+4);ctx.stroke();"
+"        ctx.beginPath();ctx.moveTo(lex-5,py+1);ctx.lineTo(lex,py+4);ctx.lineTo(lex-5,py+7);ctx.stroke();"
+"      }"
+"    }"
 "  }}"
-/* start marker */
-"  ctx.fillStyle='#ffcc00';ctx.beginPath();ctx.arc(offX+10,offY+d.ph*sc/2,5,0,2*Math.PI);ctx.fill();"
-"  ctx.fillStyle='rgba(255,204,0,0.7)';ctx.font='7px Share Tech Mono';ctx.textAlign='left';ctx.textBaseline='middle';"
-"  ctx.fillText('START',offX+17,offY+d.ph*sc/2);"
-"  var stripW=10,passes=Math.ceil(d.ph/stripW);"
-"  var estTime=(d.cols*(passes*d.pw*15+passes*stripW*15))/1000;"
+
+"  /* Start marker */"
+"  ctx.fillStyle='#ffcc00';"
+"  ctx.beginPath();ctx.arc(offX+8,offY+8,5,0,2*Math.PI);ctx.fill();"
+
+"  /* Info */"
+"  var estSec=strips*(ph*0.15+ph*0.12)*cols*rows;"
 "  document.getElementById('gpInfo').innerHTML="
-"    'Total panels: '+(d.cols*d.rows)+'<br>'"
-"    +'Grid: '+Math.round(totalW/100*10)/10+'m &times; '+Math.round(totalH/100*10)/10+'m<br>'"
-"    +'Est. clean time: ~'+Math.round(estTime)+' sec';"
+"    'Total panels: '+(cols*rows)+'<br>'"
+"    +'Strips/panel: '+strips+' (each ~'+Math.round(pw/strips)+'cm)<br>'"
+"    +'Total W: '+Math.round(totalW/100*10)/10+'m &times; H: '+Math.round(totalH/100*10)/10+'m<br>'"
+"    +'Est. clean: ~'+Math.round(estSec/60)+' min';"
 "}"
 
 "['gCols','gRows','gPW','gPH','gGap'].forEach(function(id){"
-"  document.getElementById(id).addEventListener('input',function(){"
-"    drawGrid({cols:+document.getElementById('gCols').value||1,"
-"      rows:+document.getElementById('gRows').value||1,"
-"      pw:+document.getElementById('gPW').value||100,"
-"      ph:+document.getElementById('gPH').value||170,"
-"      gap:+document.getElementById('gGap').value||5});"
-"  });"
+"  document.getElementById(id).addEventListener('input',calcAndDraw);"
 "});"
 
-/* ── Joystick ── */
+/* Joystick */
 "(function(){"
 "var joy=document.getElementById('joy'),joyH=document.getElementById('joyH');"
 "var JR=52,DEAD=12,active=false,cx=0,cy=0,lastJoyCmd='';"
@@ -773,20 +839,22 @@ static const char HTML_PAGE[] =
 "  if(a>=-30&&a<=30)return 'right';"
 "  if(a>30&&a<=65)return 'drift_right';"
 "  if(a<-30&&a>=-65)return 'drift_right';"
-"  if(a>115&&a<=150)return 'drift_left';"
-"  if(a<=-150||a>=150)return 'drift_left';"
 "  return 'stop';"
 "}"
-"function onStart(e){e.preventDefault();active=true;var r=joy.getBoundingClientRect();cx=r.left+r.width/2;cy=r.top+r.height/2;if(joy.setPointerCapture&&e.pointerId)joy.setPointerCapture(e.pointerId);}"
-"function onMove(e){if(!active)return;e.preventDefault();var t=e.touches?e.touches[0]:e;var dx=t.clientX-cx,dy=t.clientY-cy;var m=Math.sqrt(dx*dx+dy*dy);if(m>JR){dx=dx*JR/m;dy=dy*JR/m;}setH(dx,dy);var cmd=vecToCmd(dx,dy);if(cmd!==lastJoyCmd){lastJoyCmd=cmd;mv(cmd);}}"
+"function onStart(e){e.preventDefault();"
+"  if(autoRunning)return;" /* locked */
+"  active=true;"
+"  var r=joy.getBoundingClientRect();cx=r.left+r.width/2;cy=r.top+r.height/2;"
+"  if(joy.setPointerCapture&&e.pointerId)joy.setPointerCapture(e.pointerId);}"
+"function onMove(e){if(!active)return;e.preventDefault();"
+"  var t=e.touches?e.touches[0]:e;var dx=t.clientX-cx,dy=t.clientY-cy;"
+"  var m=Math.sqrt(dx*dx+dy*dy);if(m>JR){dx=dx*JR/m;dy=dy*JR/m;}"
+"  setH(dx,dy);var cmd=vecToCmd(dx,dy);if(cmd!==lastJoyCmd){lastJoyCmd=cmd;mv(cmd);}}"
 "function onEnd(e){e.preventDefault();active=false;lastJoyCmd='stop';setH(0,0);mv('stop');}"
 "joy.addEventListener('pointerdown',onStart,{passive:false});"
 "joy.addEventListener('pointermove',onMove,{passive:false});"
 "joy.addEventListener('pointerup',onEnd,{passive:false});"
 "joy.addEventListener('pointercancel',onEnd,{passive:false});"
-"joy.addEventListener('touchstart',onStart,{passive:false});"
-"joy.addEventListener('touchmove',onMove,{passive:false});"
-"joy.addEventListener('touchend',onEnd,{passive:false});"
 "document.addEventListener('mouseup',onEnd,{passive:false});"
 "})();"
 
