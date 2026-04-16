@@ -1,16 +1,15 @@
 /*
  * web_server.c  —  HTTP control interface
  *
- * CHANGES vs original:
- *  - All accident detection endpoints removed
- *  - auto_clean module integrated (replaces inline task)
- *  - /auto        → calls auto_clean_start()
- *  - /stop_auto   → calls auto_clean_stop()
- *  - /set_grid    → calls auto_clean_set_grid()
- *  - /get_grid    → calls auto_clean_get_grid()
- *  - /status      → includes auto_pct, strips_done, strips_total
- *  - /sensor_check kept for wiring verification
- *  - Removed front_dist / back_dist (never existed, kept from prior fix)
+ * New endpoints vs prior version:
+ *  - /path_record_start  → auto_path_record_start()
+ *  - /path_record_stop   → auto_path_record_stop()
+ *  - /path_play          → auto_path_play_start()
+ *  - /path_clear         → auto_path_clear()
+ *  - /path_status        → JSON: recording, playback, steps
+ *  - /move now calls auto_path_record_cmd() if recording
+ *  - /pump and /blower now call auto_path_record_peripheral() if recording
+ *  - /mpu_reset          → mpu_reset_heading() for manual heading zeroing
  */
 
 #include "web_server.h"
@@ -64,6 +63,10 @@ static esp_err_t handle_move(httpd_req_t *req)
     if (auto_clean_is_running()) {
         return httpd_resp_sendstr(req, "BLOCKED:AUTO_RUNNING");
     }
+    if (auto_path_playback()) {
+        return httpd_resp_sendstr(req, "BLOCKED:PATH_PLAYING");
+    }
+
     motor_dir_t cmd = DIR_STOP;
     if      (strcmp(dir, "forward")     == 0) cmd = DIR_FORWARD;
     else if (strcmp(dir, "backward")    == 0) cmd = DIR_BACKWARD;
@@ -76,6 +79,12 @@ static esp_err_t handle_move(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Unknown dir");
         return ESP_OK;
     }
+
+    /* Feed into path recorder if active */
+    if (auto_path_recording()) {
+        auto_path_record_cmd(cmd);
+    }
+
     motor_send_cmd(cmd);
     return httpd_resp_sendstr(req, "OK");
 }
@@ -100,7 +109,11 @@ static esp_err_t handle_pump(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing state");
         return ESP_OK;
     }
-    pump_set(strcmp(state, "on") == 0);
+    bool on = (strcmp(state, "on") == 0);
+    if (auto_path_recording()) {
+        auto_path_record_peripheral(true, on);
+    }
+    pump_set(on);
     return httpd_resp_sendstr(req, pump_get() ? "Pump ON" : "Pump OFF");
 }
 
@@ -111,7 +124,11 @@ static esp_err_t handle_blower(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing state");
         return ESP_OK;
     }
-    blower_set(strcmp(state, "on") == 0);
+    bool on = (strcmp(state, "on") == 0);
+    if (auto_path_recording()) {
+        auto_path_record_peripheral(false, on);
+    }
+    blower_set(on);
     return httpd_resp_sendstr(req, blower_get() ? "Blower ON" : "Blower OFF");
 }
 
@@ -125,6 +142,79 @@ static esp_err_t handle_ramming(httpd_req_t *req)
     motor_set_ramming(strcmp(state, "on") == 0);
     return httpd_resp_sendstr(req, "OK");
 }
+
+/* ─── Path recording endpoints ────────────────────────────── */
+
+static esp_err_t handle_path_record_start(httpd_req_t *req)
+{
+    if (auto_clean_is_running())
+        return httpd_resp_sendstr(req, "ERROR:AUTO_RUNNING");
+    if (auto_path_playback())
+        return httpd_resp_sendstr(req, "ERROR:PLAYBACK_RUNNING");
+    if (auto_path_recording())
+        return httpd_resp_sendstr(req, "ALREADY_RECORDING");
+
+    bool ok = auto_path_record_start();
+    return httpd_resp_sendstr(req, ok ? "RECORDING_STARTED" : "ERROR");
+}
+
+static esp_err_t handle_path_record_stop(httpd_req_t *req)
+{
+    if (!auto_path_recording())
+        return httpd_resp_sendstr(req, "NOT_RECORDING");
+    auto_path_record_stop();
+    char resp[64];
+    snprintf(resp, sizeof(resp), "RECORDING_STOPPED steps=%d", auto_path_len());
+    return httpd_resp_sendstr(req, resp);
+}
+
+static esp_err_t handle_path_play(httpd_req_t *req)
+{
+    if (auto_clean_is_running())
+        return httpd_resp_sendstr(req, "ERROR:AUTO_RUNNING");
+    if (auto_path_recording())
+        return httpd_resp_sendstr(req, "ERROR:RECORDING");
+    if (auto_path_len() == 0)
+        return httpd_resp_sendstr(req, "ERROR:NO_PATH");
+
+    bool ok = auto_path_play_start();
+    return httpd_resp_sendstr(req, ok ? "PLAYBACK_STARTED" : "ERROR:TASK_FAIL");
+}
+
+static esp_err_t handle_path_clear(httpd_req_t *req)
+{
+    if (auto_path_recording() || auto_path_playback())
+        return httpd_resp_sendstr(req, "ERROR:BUSY");
+    auto_path_clear();
+    return httpd_resp_sendstr(req, "PATH_CLEARED");
+}
+
+static esp_err_t handle_path_status(httpd_req_t *req)
+{
+    char json[256];
+    snprintf(json, sizeof(json),
+             "{"
+             "\"recording\":%d,"
+             "\"playback\":%d,"
+             "\"steps\":%d,"
+             "\"auto_running\":%d"
+             "}",
+             auto_path_recording() ? 1 : 0,
+             auto_path_playback()  ? 1 : 0,
+             auto_path_len(),
+             auto_clean_is_running() ? 1 : 0);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_sendstr(req, json);
+}
+
+static esp_err_t handle_mpu_reset(httpd_req_t *req)
+{
+    mpu_reset_heading();
+    return httpd_resp_sendstr(req, "HEADING_RESET");
+}
+
+/* ─── Grid endpoints ──────────────────────────────────────── */
 
 static esp_err_t handle_set_grid(httpd_req_t *req)
 {
@@ -141,9 +231,9 @@ static esp_err_t handle_set_grid(httpd_req_t *req)
     if (get_query_param(req, "blow", buf, sizeof(buf)) == 0) g.blow_enabled   = (atoi(buf) == 1);
 
     auto_clean_set_grid(&g);
-    auto_clean_get_grid(&g);   /* read back clamped values */
+    auto_clean_get_grid(&g);
 
-    int strips = (g.panel_w_cm + ROVER_WIDTH_CM - 1) / ROVER_WIDTH_CM;
+    int strips = (g.panel_h_cm + ROVER_WIDTH_CM - 1) / ROVER_WIDTH_CM;
     int total  = strips * g.panel_cols * g.panel_rows;
 
     char resp[256];
@@ -166,7 +256,7 @@ static esp_err_t handle_get_grid(httpd_req_t *req)
     clean_grid_t g;
     auto_clean_get_grid(&g);
 
-    int strips = (g.panel_w_cm + ROVER_WIDTH_CM - 1) / ROVER_WIDTH_CM;
+    int strips = (g.panel_h_cm + ROVER_WIDTH_CM - 1) / ROVER_WIDTH_CM;
     int total  = strips * g.panel_cols * g.panel_rows;
 
     char resp[256];
@@ -185,34 +275,35 @@ static esp_err_t handle_get_grid(httpd_req_t *req)
     return httpd_resp_sendstr(req, resp);
 }
 
+/* ─── Status ──────────────────────────────────────────────── */
+
 static esp_err_t handle_status(httpd_req_t *req)
 {
     ir_status_t ir  = ir_get_status();
     mpu_data_t  mpu = mpu_get();
 
-    char json[900];
+    char json[1024];
     snprintf(json, sizeof(json),
              "{"
              "\"direction\":\"%s\","
              "\"tail\":%d,"
-             /* IR */
              "\"ir_fl\":%d,\"ir_fr\":%d,\"ir_bl\":%d,\"ir_br\":%d,"
              "\"front_blocked\":%d,\"back_blocked\":%d,"
-             /* MPU */
              "\"mpu_ready\":%d,"
              "\"vib\":%.3f,"
-             "\"heading\":%.1f,"
+             "\"heading\":%.2f,"
              "\"mpu_temp\":%d,"
              "\"accel_x\":%.3f,\"accel_y\":%.3f,\"accel_z\":%.3f,"
-             "\"gyro_z\":%.2f,"
-             /* peripherals */
+             "\"gyro_z\":%.3f,"
              "\"ramming\":%d,\"pump\":%d,\"blower\":%d,"
-             /* auto clean progress */
              "\"auto_running\":%d,"
              "\"auto_pct\":%d,"
              "\"auto_strips_done\":%d,"
              "\"auto_strips_total\":%d,"
-             "\"auto_state\":\"%s\""
+             "\"auto_state\":\"%s\","
+             "\"path_recording\":%d,"
+             "\"path_playback\":%d,"
+             "\"path_steps\":%d"
              "}",
              motor_dir_to_str(motor_get_direction()),
              (int)(s_tail_light ? 1 : 0),
@@ -237,7 +328,10 @@ static esp_err_t handle_status(httpd_req_t *req)
              auto_clean_strips_total(),
              auto_clean_state() == CLEAN_IDLE    ? "IDLE"    :
              auto_clean_state() == CLEAN_RUNNING ? "RUNNING" :
-             auto_clean_state() == CLEAN_DONE    ? "DONE"    : "ERROR");
+             auto_clean_state() == CLEAN_DONE    ? "DONE"    : "ERROR",
+             auto_path_recording() ? 1 : 0,
+             auto_path_playback()  ? 1 : 0,
+             auto_path_len());
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -261,6 +355,7 @@ static esp_err_t handle_sensor_check(httpd_req_t *req)
              "\"mpu_enabled\":%d,"
              "\"mpu_ready\":%d,"
              "\"mpu_temp_c\":%d,"
+             "\"mpu_heading\":%.2f,"
              "\"mpu_accel_x\":%.3f,"
              "\"mpu_accel_y\":%.3f,"
              "\"mpu_accel_z\":%.3f,"
@@ -276,6 +371,7 @@ static esp_err_t handle_sensor_check(httpd_req_t *req)
              MPU_ENABLED,
              (int)(mpu_ok ? 1 : 0),
              m.temp_c,
+             (double)m.heading_deg,
              (double)m.accel_x,
              (double)m.accel_y,
              (double)m.accel_z,
@@ -292,6 +388,8 @@ static esp_err_t handle_auto(httpd_req_t *req)
 {
     if (auto_clean_is_running())
         return httpd_resp_sendstr(req, "ALREADY_RUNNING");
+    if (auto_path_recording())
+        return httpd_resp_sendstr(req, "ERROR:RECORDING_ACTIVE");
 
     if (auto_clean_start())
         return httpd_resp_sendstr(req, "AUTO_STARTED");
@@ -317,7 +415,7 @@ esp_err_t web_server_start(void)
 {
     httpd_config_t cfg    = HTTPD_DEFAULT_CONFIG();
     cfg.server_port       = HTTP_SERVER_PORT;
-    cfg.max_uri_handlers  = 16;
+    cfg.max_uri_handlers  = 24;
     cfg.lru_purge_enable  = true;
     cfg.recv_wait_timeout = 5;
     cfg.send_wait_timeout = 5;
@@ -329,19 +427,27 @@ esp_err_t web_server_start(void)
     }
 
     static const httpd_uri_t uris[] = {
-        {.uri = "/",             .method = HTTP_GET, .handler = handle_root},
-        {.uri = "/move",         .method = HTTP_GET, .handler = handle_move},
-        {.uri = "/tail",         .method = HTTP_GET, .handler = handle_tail},
-        {.uri = "/pump",         .method = HTTP_GET, .handler = handle_pump},
-        {.uri = "/blower",       .method = HTTP_GET, .handler = handle_blower},
-        {.uri = "/ramming",      .method = HTTP_GET, .handler = handle_ramming},
-        {.uri = "/set_grid",     .method = HTTP_GET, .handler = handle_set_grid},
-        {.uri = "/get_grid",     .method = HTTP_GET, .handler = handle_get_grid},
-        {.uri = "/status",       .method = HTTP_GET, .handler = handle_status},
-        {.uri = "/sensor_check", .method = HTTP_GET, .handler = handle_sensor_check},
-        {.uri = "/auto",         .method = HTTP_GET, .handler = handle_auto},
-        {.uri = "/stop_auto",    .method = HTTP_GET, .handler = handle_stop_auto},
+        {.uri = "/",                   .method = HTTP_GET, .handler = handle_root},
+        {.uri = "/move",               .method = HTTP_GET, .handler = handle_move},
+        {.uri = "/tail",               .method = HTTP_GET, .handler = handle_tail},
+        {.uri = "/pump",               .method = HTTP_GET, .handler = handle_pump},
+        {.uri = "/blower",             .method = HTTP_GET, .handler = handle_blower},
+        {.uri = "/ramming",            .method = HTTP_GET, .handler = handle_ramming},
+        {.uri = "/set_grid",           .method = HTTP_GET, .handler = handle_set_grid},
+        {.uri = "/get_grid",           .method = HTTP_GET, .handler = handle_get_grid},
+        {.uri = "/status",             .method = HTTP_GET, .handler = handle_status},
+        {.uri = "/sensor_check",       .method = HTTP_GET, .handler = handle_sensor_check},
+        {.uri = "/auto",               .method = HTTP_GET, .handler = handle_auto},
+        {.uri = "/stop_auto",          .method = HTTP_GET, .handler = handle_stop_auto},
+        /* Path recording/playback */
+        {.uri = "/path_record_start",  .method = HTTP_GET, .handler = handle_path_record_start},
+        {.uri = "/path_record_stop",   .method = HTTP_GET, .handler = handle_path_record_stop},
+        {.uri = "/path_play",          .method = HTTP_GET, .handler = handle_path_play},
+        {.uri = "/path_clear",         .method = HTTP_GET, .handler = handle_path_clear},
+        {.uri = "/path_status",        .method = HTTP_GET, .handler = handle_path_status},
+        {.uri = "/mpu_reset",          .method = HTTP_GET, .handler = handle_mpu_reset},
     };
+
     const int n = (int)(sizeof(uris) / sizeof(uris[0]));
     for (int i = 0; i < n; i++)
         httpd_register_uri_handler(s_server, &uris[i]);

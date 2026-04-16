@@ -1,15 +1,13 @@
 /*
- * html_page.c  —  ESP32 Solar Panel Cleaner dashboard HTML
+ * html_page.c  —  Solar Panel Cleaner dashboard
  *
- * CHANGES vs original:
- *  - All accident detection UI removed (banner, reset button, alert)
- *  - Auto-clean section: real-time progress bar, strip counter,
- *    percentage display, state label
- *  - Cleaning pattern diagram shown in grid editor
- *  - /status JSON now uses auto_pct / auto_strips_done / auto_strips_total
- *  - Manual drive locked out while auto-clean is running
- *  - Grid editor shows calculated strips_per_panel and est. time
- *  - Sensor check panel updated (rover dimensions shown)
+ * NEW vs prior version:
+ *  - Path Recording panel: Record → Drive → Stop → Play
+ *  - MPU heading display now shows live ±0.1° resolution
+ *  - "Reset Heading" button (zeroes yaw accumulator)
+ *  - Status bar shows path_recording / path_playback states
+ *  - Drive panel shows REC indicator when recording
+ *  - Toasts for all new path events
  */
 
 #include "html_page.h"
@@ -29,6 +27,7 @@ static const char HTML_PAGE[] =
 "--accent:#00d478;--accent2:#ff4b2b;--accent3:#00aaff;--warn:#ffcc00;"
 "--text:#c8e8d8;--dim:#507060;--pump:#00cfff;--blow:#ff9900;"
 "--good:#00d478;--bad:#ff4b2b;--idle:#334455;"
+"--rec:#ff2255;"
 "}"
 "*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}"
 "body{font-family:'Orbitron',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;"
@@ -49,12 +48,18 @@ static const char HTML_PAGE[] =
 ".toast.err{background:rgba(255,75,43,0.2);border-color:rgba(255,75,43,0.6);color:#ff6b4b;}"
 ".toast.warn{background:rgba(255,204,0,0.15);border-color:rgba(255,204,0,0.5);color:var(--warn);}"
 ".toast.ok{background:rgba(0,212,120,0.15);border-color:rgba(0,212,120,0.4);color:var(--accent);}"
+".toast.rec{background:rgba(255,34,85,0.2);border-color:rgba(255,34,85,0.6);color:var(--rec);}"
 "@keyframes toastIn{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:none}}"
 "@keyframes toastOut{from{opacity:1}to{opacity:0}}"
 
 "#obsBanner{display:none;margin:0 10px 8px;padding:8px 14px;border-radius:8px;"
 "background:rgba(255,204,0,0.1);border:1px solid rgba(255,204,0,0.4);"
 "color:var(--warn);font-weight:700;font-size:11px;text-align:center;}"
+
+"#recBanner{display:none;margin:0 10px 8px;padding:8px 14px;border-radius:8px;"
+"background:rgba(255,34,85,0.1);border:1px solid rgba(255,34,85,0.4);"
+"color:var(--rec);font-weight:700;font-size:11px;text-align:center;"
+"animation:blink 0.8s infinite;}"
 
 ".grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:10px;max-width:1100px;margin:0 auto;}"
 "@media(max-width:640px){.grid{grid-template-columns:1fr;}}"
@@ -71,8 +76,8 @@ static const char HTML_PAGE[] =
 ".sv{font-family:'Share Tech Mono';font-size:11px;}"
 ".ok{color:var(--accent);}.warn2{color:var(--warn);font-weight:700;}"
 ".pump-on{color:var(--pump);font-weight:700;}.blow-on{color:var(--blow);font-weight:700;}"
+".rec-on{color:var(--rec);font-weight:700;animation:blink 0.8s infinite;}"
 
-/* IR grid */
 ".ir-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:4px;}"
 ".ir-cell{border:1px solid var(--border);border-radius:8px;padding:10px 8px;text-align:center;transition:all 0.2s;}"
 ".ir-cell .ic-label{font-size:8px;color:var(--dim);letter-spacing:2px;margin-bottom:6px;}"
@@ -85,16 +90,14 @@ static const char HTML_PAGE[] =
 ".ir-status-row{display:flex;justify-content:space-between;margin-top:10px;padding-top:10px;"
 "border-top:1px solid var(--border);font-family:'Share Tech Mono';font-size:9px;}"
 ".ir-zone{text-align:center;}"
-".ir-zone .iz-label{color:var(--dim);letter-spacing:1px;margin-bottom:3px;}"
-".ir-zone .iz-val{font-size:12px;font-weight:700;}"
+".iz-label{color:var(--dim);letter-spacing:1px;margin-bottom:3px;}"
+".iz-val{font-size:12px;font-weight:700;}"
 
-/* MPU */
 ".mpu-ready-badge{display:inline-block;padding:3px 10px;border-radius:12px;font-size:9px;letter-spacing:2px;margin-bottom:10px;}"
 ".mpu-ready-badge.ok{background:rgba(0,212,120,0.15);border:1px solid rgba(0,212,120,0.4);color:var(--accent);}"
 ".mpu-ready-badge.fail{background:rgba(255,75,43,0.15);border:1px solid rgba(255,75,43,0.4);color:var(--accent2);}"
 ".mpu-row{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px;}"
 
-/* compass */
 ".compass-wrap{display:flex;flex-direction:column;align-items:center;gap:4px;}"
 ".compass{position:relative;width:80px;height:80px;border-radius:50%;"
 "background:radial-gradient(circle,#0a1a14 0,#040c08 100%);"
@@ -106,12 +109,12 @@ static const char HTML_PAGE[] =
 ".compass-w{position:absolute;left:4px;top:50%;transform:translateY(-50%);font-size:7px;color:var(--dim);}"
 ".compass-needle{position:absolute;left:50%;top:50%;width:2px;height:28px;margin-left:-1px;margin-top:-28px;"
 "background:linear-gradient(var(--accent2) 0%,transparent 100%);"
-"transform-origin:bottom center;border-radius:2px 2px 0 0;transition:transform 0.3s ease;}"
+"transform-origin:bottom center;border-radius:2px 2px 0 0;transition:transform 0.15s linear;}"
 ".compass-dot{position:absolute;left:50%;top:50%;width:6px;height:6px;border-radius:50%;"
 "background:var(--accent);transform:translate(-50%,-50%);box-shadow:0 0 6px var(--accent);}"
-".compass-hdg{font-family:'Share Tech Mono';font-size:11px;color:var(--accent);}"
+".compass-hdg{font-family:'Share Tech Mono';font-size:14px;color:var(--accent);letter-spacing:1px;}"
+".compass-gz{font-family:'Share Tech Mono';font-size:9px;color:var(--dim);margin-top:2px;}"
 
-/* tilt */
 ".tilt-wrap{display:flex;flex-direction:column;align-items:center;gap:4px;}"
 ".tilt-plate{position:relative;width:80px;height:80px;border-radius:50%;"
 "background:radial-gradient(circle,#0a1420 0,#050a10 100%);"
@@ -122,28 +125,25 @@ static const char HTML_PAGE[] =
 ".tilt-bubble{position:absolute;width:14px;height:14px;border-radius:50%;"
 "background:radial-gradient(circle at 35% 35%,rgba(0,170,255,0.9),rgba(0,100,200,0.5));"
 "border:1px solid rgba(0,200,255,0.8);box-shadow:0 0 8px rgba(0,170,255,0.5);"
-"left:50%;top:50%;transform:translate(-50%,-50%);transition:left 0.25s,top 0.25s;}"
+"left:50%;top:50%;transform:translate(-50%,-50%);transition:left 0.15s,top 0.15s;}"
 ".tilt-label{font-family:'Share Tech Mono';font-size:9px;color:var(--accent3);letter-spacing:1px;}"
 
-/* accel bars */
 ".accel-bars{margin-top:8px;}"
 ".ab-row{display:flex;align-items:center;gap:6px;margin:3px 0;}"
 ".ab-axis{font-family:'Share Tech Mono';font-size:9px;color:var(--dim);width:14px;text-align:right;}"
 ".ab-track{flex:1;height:6px;background:rgba(255,255,255,0.05);border-radius:3px;overflow:hidden;position:relative;}"
 ".ab-center{position:absolute;left:50%;top:0;bottom:0;width:1px;background:rgba(255,255,255,0.15);}"
-".ab-fill{position:absolute;height:100%;border-radius:3px;transition:left 0.2s,width 0.2s;}"
+".ab-fill{position:absolute;height:100%;border-radius:3px;transition:left 0.15s,width 0.15s;}"
 ".ab-fill.ax{background:rgba(255,75,43,0.7);}"
 ".ab-fill.ay{background:rgba(0,212,120,0.7);}"
 ".ab-fill.az{background:rgba(0,170,255,0.7);}"
 ".ab-val{font-family:'Share Tech Mono';font-size:9px;color:var(--text);width:42px;text-align:right;}"
 
-/* vib */
 ".vib-meter{margin-top:8px;}"
 ".vib-track{height:10px;background:rgba(255,255,255,0.05);border-radius:5px;overflow:hidden;}"
 ".vib-fill{height:100%;border-radius:5px;transition:width 0.2s,background 0.2s;background:var(--accent);}"
 ".vib-labels{display:flex;justify-content:space-between;font-family:'Share Tech Mono';font-size:8px;color:var(--dim);margin-top:2px;}"
 
-/* buttons */
 ".btn{padding:8px 10px;margin:2px;font-family:'Orbitron',sans-serif;font-size:9px;"
 "font-weight:700;letter-spacing:1px;border:1px solid rgba(255,255,255,0.1);border-radius:6px;"
 "cursor:pointer;transition:all 0.12s;text-transform:uppercase;user-select:none;"
@@ -155,6 +155,9 @@ static const char HTML_PAGE[] =
 ".btn.tail{background:rgba(255,204,0,0.08);color:var(--warn);border-color:rgba(255,204,0,0.25);}"
 ".btn.rst{background:rgba(0,170,255,0.08);color:var(--accent3);border-color:rgba(0,170,255,0.25);}"
 ".btn.active{box-shadow:0 0 12px rgba(0,212,120,0.5);background:rgba(0,212,120,0.2);}"
+".btn.rec-btn{background:rgba(255,34,85,0.12);color:var(--rec);border-color:rgba(255,34,85,0.4);}"
+".btn.rec-btn.recording{background:rgba(255,34,85,0.3);box-shadow:0 0 16px rgba(255,34,85,0.5);animation:blink 0.8s infinite;}"
+".btn.play-btn{background:rgba(0,212,120,0.12);color:var(--accent);border-color:rgba(0,212,120,0.4);}"
 ".btn.auto-btn{background:rgba(0,212,120,0.12);color:var(--accent);border-color:rgba(0,212,120,0.4);"
 "width:100%;padding:10px;margin-top:8px;letter-spacing:2px;}"
 ".btn.stop-auto{background:rgba(255,75,43,0.12);color:var(--accent2);border-color:rgba(255,75,43,0.4);"
@@ -162,7 +165,8 @@ static const char HTML_PAGE[] =
 ".btn.chk-btn{background:rgba(0,170,255,0.08);color:var(--accent3);border-color:rgba(0,170,255,0.3);"
 "width:100%;padding:9px;margin-top:8px;}"
 
-/* joystick */
+"@keyframes blink{0%,100%{opacity:1}50%{opacity:0.4}}"
+
 ".jw{display:flex;justify-content:center;margin:8px 0;}"
 ".joystick{width:140px;height:140px;border-radius:50%;"
 "background:radial-gradient(circle at 30% 30%,#162030 0,#050810 60%);"
@@ -177,7 +181,6 @@ static const char HTML_PAGE[] =
 ".bgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:3px;margin-top:8px;}"
 ".bgrid .btn{padding:6px 2px;font-size:8px;}"
 
-/* peripheral row */
 ".prow{display:flex;gap:8px;margin-top:10px;padding-top:10px;border-top:1px solid var(--border);}"
 ".pbtn{flex:1;padding:10px 4px;border-radius:6px;border:1px solid;cursor:pointer;"
 "font-family:'Orbitron',sans-serif;font-size:9px;font-weight:700;letter-spacing:1px;text-align:center;transition:all 0.15s;}"
@@ -186,7 +189,6 @@ static const char HTML_PAGE[] =
 ".pbtn-blow{background:rgba(255,153,0,0.06);color:var(--blow);border-color:rgba(255,153,0,0.3);}"
 ".pbtn-blow.bon{background:rgba(255,153,0,0.2);box-shadow:0 0 14px rgba(255,153,0,0.4);}"
 
-/* LCD */
 ".lcd{background:#060f06;border:2px solid #1a4a1a;border-radius:6px;padding:7px 10px;"
 "font-family:'Share Tech Mono';font-size:12px;color:#33ff66;"
 "text-shadow:0 0 6px rgba(0,255,80,0.5);box-shadow:0 0 10px rgba(0,80,0,0.4) inset;"
@@ -198,7 +200,6 @@ static const char HTML_PAGE[] =
 "#pingDot.ok{background:var(--accent);box-shadow:0 0 6px var(--accent);}"
 "#pingDot.err{background:var(--accent2);}"
 
-/* auto clean progress */
 ".auto-box{margin-top:10px;padding:12px;border-radius:8px;border:1px solid var(--border);"
 "background:rgba(0,0,0,0.3);}"
 ".auto-state-label{font-size:10px;font-weight:700;letter-spacing:3px;margin-bottom:8px;}"
@@ -206,20 +207,28 @@ static const char HTML_PAGE[] =
 ".auto-state-label.running{color:var(--accent);animation:blink 1.2s infinite;}"
 ".auto-state-label.done{color:var(--accent3);}"
 ".auto-state-label.error{color:var(--accent2);}"
-"@keyframes blink{0%,100%{opacity:1}50%{opacity:0.3}}"
 ".progress-track{height:12px;background:rgba(255,255,255,0.05);border-radius:6px;overflow:hidden;margin:6px 0;}"
 ".progress-fill{height:100%;border-radius:6px;background:linear-gradient(90deg,#00a058,#00d478);"
 "transition:width 0.5s ease;}"
 ".progress-labels{display:flex;justify-content:space-between;font-family:'Share Tech Mono';font-size:9px;color:var(--dim);}"
 
-/* sensor check */
+/* path panel */
+".path-panel{border:1px solid rgba(255,34,85,0.25);border-radius:8px;padding:12px;margin-top:10px;"
+"background:rgba(255,34,85,0.04);}"
+".path-panel h4{font-size:10px;font-weight:700;letter-spacing:3px;color:var(--rec);"
+"text-transform:uppercase;margin-bottom:10px;}"
+".path-status{font-family:'Share Tech Mono';font-size:10px;margin-bottom:8px;padding:6px 10px;"
+"border-radius:6px;background:rgba(0,0,0,0.4);border:1px solid rgba(255,255,255,0.06);}"
+".path-row{display:flex;gap:6px;flex-wrap:wrap;}"
+".path-count{font-family:'Share Tech Mono';font-size:9px;color:var(--dim);margin-top:8px;}"
+".path-count span{color:var(--accent3);}"
+
 ".chk-table{width:100%;border-collapse:collapse;font-family:'Share Tech Mono';font-size:10px;margin-top:8px;}"
 ".chk-table th{color:var(--dim);font-size:8px;letter-spacing:2px;text-align:left;padding:3px 6px;"
 "border-bottom:1px solid var(--border);}"
 ".chk-table td{padding:5px 6px;border-bottom:1px solid rgba(255,255,255,0.04);}"
 ".chk-ok{color:var(--accent);}.chk-fail{color:var(--accent2);font-weight:700;}.chk-na{color:var(--dim);}"
 
-/* grid editor */
 ".ge-row{display:flex;align-items:center;gap:8px;margin:5px 0;}"
 ".ge-label{font-family:'Share Tech Mono';font-size:9px;color:var(--dim);width:110px;letter-spacing:1px;}"
 ".ge-input{flex:1;background:rgba(0,0,0,0.5);border:1px solid var(--border);border-radius:4px;"
@@ -230,8 +239,6 @@ static const char HTML_PAGE[] =
 "#gridPreview{margin-top:10px;padding:8px;background:rgba(0,0,0,0.4);"
 "border:1px solid rgba(0,212,120,0.12);border-radius:6px;display:flex;justify-content:center;}"
 ".brow{display:flex;flex-wrap:wrap;gap:4px;margin-top:8px;}"
-".info-chip{display:inline-block;padding:3px 8px;border-radius:10px;font-family:'Share Tech Mono';"
-"font-size:9px;background:rgba(0,170,255,0.1);border:1px solid rgba(0,170,255,0.25);color:var(--accent3);margin:2px;}"
 "</style>"
 "</head>"
 "<body>"
@@ -242,12 +249,13 @@ static const char HTML_PAGE[] =
 "<small>AP: SolarCleaner &nbsp;|&nbsp; 192.168.4.1</small>"
 "</header>"
 "<div id='obsBanner'>&#128680; OBSTACLE DETECTED &mdash; PATH BLOCKED</div>"
+"<div id='recBanner'>&#9679; PATH RECORDING ACTIVE &mdash; DRIVE THE ROVER NOW</div>"
 
 "<div class='grid'>"
 
 /* ══ DRIVE PANEL ══ */
 "<div class='panel'>"
-"<h3>&#127918; Manual Drive</h3>"
+"<h3>&#127918; Manual Drive <span id='recIndicator' style='display:none;color:var(--rec);font-size:8px;letter-spacing:2px;animation:blink 0.8s infinite'>&#9679; REC</span></h3>"
 "<div id='autoLockMsg' style='display:none;padding:8px;background:rgba(0,212,120,0.1);border:1px solid rgba(0,212,120,0.3);"
 "border-radius:6px;font-family:\"Share Tech Mono\";font-size:9px;color:var(--accent);text-align:center;margin-bottom:8px;'>"
 "&#9888; AUTO-CLEAN RUNNING &mdash; MANUAL DRIVE LOCKED"
@@ -268,6 +276,44 @@ static const char HTML_PAGE[] =
 "<div class='prow'>"
 "<div class='pbtn pbtn-pump' id='bPump' onclick='togglePump()'>&#128166; PUMP<br><span id='sPumpLbl'>OFF</span></div>"
 "<div class='pbtn pbtn-blow' id='bBlow' onclick='toggleBlow()'>&#127756; BLOWER<br><span id='sBlowLbl'>OFF</span></div>"
+"</div>"
+"</div>"
+
+/* ══ PATH RECORDING PANEL ══ */
+"<div class='panel'>"
+"<h3>&#127936; Path Record &amp; Replay</h3>"
+"<div style='font-size:9px;color:var(--dim);font-family:\"Share Tech Mono\";line-height:1.8;margin-bottom:10px;'>"
+"1&#41; Press <span style='color:var(--rec)'>START REC</span> &rarr; drive rover over one panel<br>"
+"2&#41; Press <span style='color:var(--warn)'>STOP REC</span> when done with one panel<br>"
+"3&#41; Place rover at start &rarr; press <span style='color:var(--accent)'>PLAY PATH</span><br>"
+"Rover repeats your exact moves on every panel automatically."
+"</div>"
+"<div class='path-status'>"
+"<div style='display:flex;justify-content:space-between;align-items:center;'>"
+"<span id='pathStateLabel' style='color:var(--dim);font-size:9px;letter-spacing:2px;'>IDLE</span>"
+"<span id='pathStepsLabel' style='color:var(--accent3);'>0 steps</span>"
+"</div>"
+"<div style='margin-top:6px;'>"
+"<div id='pathProgBar' style='height:4px;background:rgba(255,255,255,0.05);border-radius:2px;overflow:hidden;'>"
+"<div id='pathProgFill' style='height:100%;width:0%;background:var(--rec);transition:width 0.3s;border-radius:2px;'></div>"
+"</div>"
+"</div>"
+"</div>"
+"<div class='path-row'>"
+"<button class='btn rec-btn' id='btnRecStart' onclick='pathRecStart()' style='flex:1;padding:10px 4px;'>&#9679; START REC</button>"
+"<button class='btn' id='btnRecStop' onclick='pathRecStop()' style='flex:1;padding:10px 4px;background:rgba(255,204,0,0.1);color:var(--warn);border-color:rgba(255,204,0,0.4);'>&#9632; STOP REC</button>"
+"</div>"
+"<div class='path-row' style='margin-top:6px;'>"
+"<button class='btn play-btn' id='btnPathPlay' onclick='pathPlay()' style='flex:1;padding:10px 4px;'>&#9654; PLAY PATH</button>"
+"<button class='btn stop-btn' id='btnPathStop' onclick='stopAuto()' style='flex:1;padding:10px 4px;'>&#9632; STOP</button>"
+"<button class='btn' id='btnPathClear' onclick='pathClear()' style='flex:1;padding:10px 4px;background:rgba(120,120,120,0.08);color:var(--dim);border-color:rgba(120,120,120,0.2);font-size:8px;'>&#128465; CLEAR</button>"
+"</div>"
+"<div style='margin-top:10px;padding:8px;border-radius:6px;border:1px solid rgba(0,170,255,0.15);"
+"background:rgba(0,170,255,0.04);font-family:\"Share Tech Mono\";font-size:8px;color:var(--dim);line-height:1.8;'>"
+"<div style='color:var(--accent3);font-size:9px;margin-bottom:4px;'>HOW IT WORKS</div>"
+"Every joystick/button input, pump, and blower toggle is timestamped<br>"
+"and stored. Playback replays each segment at exactly the same speed.<br>"
+"Up to 256 segments can be stored (cleared on power cycle)."
 "</div>"
 "</div>"
 
@@ -297,7 +343,10 @@ static const char HTML_PAGE[] =
 /* ══ MPU-6050 ══ */
 "<div class='panel'>"
 "<h3>&#129517; MPU-6050 IMU</h3>"
+"<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;'>"
 "<div id='mpuBadge' class='mpu-ready-badge fail'>NOT DETECTED</div>"
+"<button class='btn rst' onclick='resetHeading()' style='padding:4px 10px;font-size:8px;'>&#9654; ZERO HDG</button>"
+"</div>"
 "<div class='mpu-row'>"
 "<div class='compass-wrap'>"
 "<div class='compass'>"
@@ -307,8 +356,8 @@ static const char HTML_PAGE[] =
 "<div class='compass-needle' id='cNeedle'></div>"
 "<div class='compass-dot'></div>"
 "</div>"
-"<div class='compass-hdg' id='cHdg'>---&deg;</div>"
-"<div style='font-size:8px;color:var(--dim);font-family:\"Share Tech Mono\";'>HEADING</div>"
+"<div class='compass-hdg' id='cHdg'>0.00&deg;</div>"
+"<div class='compass-gz' id='cGz'>Gz: 0.000 &deg;/s</div>"
 "</div>"
 "<div class='tilt-wrap'>"
 "<div class='tilt-plate'>"
@@ -339,6 +388,7 @@ static const char HTML_PAGE[] =
 "<h3>&#128202; System Status</h3>"
 "<div class='si'><span class='sk'>Direction</span><span class='sv' id='sDir'>&mdash;</span></div>"
 "<div class='si'><span class='sk'>Heading</span><span class='sv' id='sHdg'>&mdash;</span></div>"
+"<div class='si'><span class='sk'>Gyro Z</span><span class='sv' id='sGz'>&mdash;</span></div>"
 "<div class='si'><span class='sk'>Tail Light</span><span class='sv' id='sTail'>&mdash;</span></div>"
 "<div class='si'><span class='sk'>Vibration</span><span class='sv' id='sVib'>&mdash;</span></div>"
 "<div class='si'><span class='sk'>Front Blocked</span><span class='sv' id='sFObs'>&mdash;</span></div>"
@@ -346,6 +396,7 @@ static const char HTML_PAGE[] =
 "<div class='si'><span class='sk'>Water Pump</span><span class='sv' id='sPumpSt'>&mdash;</span></div>"
 "<div class='si'><span class='sk'>Air Blower</span><span class='sv' id='sBlowSt'>&mdash;</span></div>"
 "<div class='si'><span class='sk'>Auto State</span><span class='sv' id='sAutoSt'>&mdash;</span></div>"
+"<div class='si'><span class='sk'>Path</span><span class='sv' id='sPathSt'>&mdash;</span></div>"
 "<div class='si'><span class='sk'>Ping</span><span class='sv' id='sPing'>&mdash;</span></div>"
 "<div style='margin-top:10px;padding-top:10px;border-top:1px solid var(--border);'>"
 "<div style='font-size:9px;color:var(--dim);letter-spacing:2px;margin-bottom:8px;font-family:\"Share Tech Mono\"'>CONTROLS</div>"
@@ -391,7 +442,6 @@ static const char HTML_PAGE[] =
 "</div>"
 "<div id='gridMsg' style='font-family:\"Share Tech Mono\";font-size:9px;color:var(--accent);margin-top:6px;min-height:14px;'></div>"
 
-/* auto clean progress */
 "<div class='auto-box'>"
 "<div class='auto-state-label idle' id='autoStateLabel'>IDLE &mdash; READY TO CLEAN</div>"
 "<div class='progress-track'><div class='progress-fill' id='progressFill' style='width:0'></div></div>"
@@ -412,9 +462,9 @@ static const char HTML_PAGE[] =
 "<div style='margin-top:8px;padding:8px;background:rgba(0,0,0,0.3);border-radius:6px;"
 "font-family:\"Share Tech Mono\";font-size:8px;color:var(--dim);line-height:1.8;'>"
 "<div style='color:var(--accent);font-size:9px;margin-bottom:4px;'>PATTERN LEGEND</div>"
-"<div>&#9660; Green arrows = FORWARD sweep (pump+blower ON)</div>"
-"<div>&#9650; Grey arrows  = BACKWARD rewind (blower OFF)</div>"
-"<div>&#9658; Blue arrow   = lateral shift (between strips)</div>"
+"<div>&#9660; Green arrows = FORWARD sweep (gyro-guided)</div>"
+"<div>&#9650; Grey arrows  = lateral step turn sequence</div>"
+"<div>&#9658; Blue arrow   = inter-panel advance</div>"
 "<div>&#9733; Yellow dot   = start position (top-left)</div>"
 "</div>"
 "</div>"
@@ -423,7 +473,7 @@ static const char HTML_PAGE[] =
 
 "</div>"
 
-/* ══════ JAVASCRIPT ══════ */
+/* ════════════════ JAVASCRIPT ════════════════ */
 "<script>"
 
 "function toast(msg,type){"
@@ -438,10 +488,13 @@ static const char HTML_PAGE[] =
 "var lastFB=0,lastBB=0,ramOn=0,pumpOn=0,blowOn=0;"
 "var lastCmd='',inFlight=0,pendingCmd=null;"
 "var autoRunning=false,lastAutoRunning=false;"
+"var pathRecording=false,lastPathRecording=false;"
+"var pathPlayback=false,lastPathPlayback=false;"
+"var pathSteps=0;"
 
-/* Move */
+/* ── Move ── */
 "function mv(dir){"
-"  if(autoRunning)return;" /* locked during auto */
+"  if(autoRunning||pathPlayback)return;"
 "  if(dir===lastCmd&&dir!=='stop')return;"
 "  if(inFlight>0){pendingCmd=dir;return;}"
 "  sendMove(dir);"
@@ -451,7 +504,7 @@ static const char HTML_PAGE[] =
 "  fetch('/move?dir='+dir,{method:'GET',keepalive:true})"
 "    .then(function(r){return r.text();})"
 "    .then(function(t){inFlight--;flushPending();"
-"      if(t==='BLOCKED:AUTO_RUNNING')toast('Manual drive locked: Auto-clean running','warn');"
+"      if(t.indexOf('BLOCKED')===0)toast(t,'warn');"
 "    })"
 "    .catch(function(){inFlight--;flushPending();});"
 "}"
@@ -499,6 +552,81 @@ static const char HTML_PAGE[] =
 "  else{b.textContent='RAMMING: OFF';b.style.background='rgba(255,51,0,0.08)';b.style.boxShadow='none';}"
 "}"
 
+"function resetHeading(){"
+"  fetch('/mpu_reset').then(function(r){return r.text();}).then(function(t){toast('Heading zeroed','ok');}).catch(function(){});"
+"}"
+
+/* ── Path recording ── */
+"function pathRecStart(){"
+"  fetch('/path_record_start').then(function(r){return r.text();})"
+"  .then(function(t){"
+"    if(t==='RECORDING_STARTED'){toast('&#9679; Recording started — drive now!','rec');}"
+"    else{toast(t,'warn');}"
+"  }).catch(function(){toast('Request failed','err');});"
+"}"
+"function pathRecStop(){"
+"  fetch('/path_record_stop').then(function(r){return r.text();})"
+"  .then(function(t){toast(t,'ok');}).catch(function(){toast('Request failed','err');});"
+"}"
+"function pathPlay(){"
+"  if(pathSteps===0){toast('No path recorded yet','warn');return;}"
+"  if(!confirm('Play back the recorded path?\\n\\nPlace rover at the START POSITION first!'))return;"
+"  fetch('/path_play').then(function(r){return r.text();})"
+"  .then(function(t){"
+"    if(t==='PLAYBACK_STARTED'){toast('&#9654; Playback started','ok');}"
+"    else{toast(t,'warn');}"
+"  }).catch(function(){toast('Request failed','err');});"
+"}"
+"function pathClear(){"
+"  if(pathSteps>0&&!confirm('Clear the recorded path ('+pathSteps+' steps)?'))return;"
+"  fetch('/path_clear').then(function(r){return r.text();})"
+"  .then(function(t){toast(t,'ok');}).catch(function(){});"
+"}"
+
+"function updatePathUI(d){"
+"  var rec=!!d.path_recording;"
+"  var play=!!d.path_playback;"
+"  var steps=d.path_steps||0;"
+"  pathRecording=rec;pathPlayback=play;pathSteps=steps;"
+
+"  var stLabel=document.getElementById('pathStateLabel');"
+"  var stSteps=document.getElementById('pathStepsLabel');"
+"  var recInd=document.getElementById('recIndicator');"
+"  var recBanner=document.getElementById('recBanner');"
+"  var progFill=document.getElementById('pathProgFill');"
+
+"  if(stLabel)stLabel.textContent=rec?'RECORDING':play?'PLAYING BACK':'IDLE';"
+"  if(stLabel)stLabel.style.color=rec?'var(--rec)':play?'var(--accent)':'var(--dim)';"
+"  if(stSteps)stSteps.textContent=steps+' steps';"
+"  if(recInd)recInd.style.display=rec?'inline':'none';"
+"  if(recBanner)recBanner.style.display=rec?'block':'none';"
+
+"  var maxSteps=256;"
+"  if(progFill){progFill.style.width=(steps/maxSteps*100)+'%';"
+"    progFill.style.background=rec?'var(--rec)':play?'var(--accent)':'rgba(0,170,255,0.6)';}"
+
+"  var sPathSt=document.getElementById('sPathSt');"
+"  if(sPathSt){"
+"    if(rec){sPathSt.textContent='REC ('+steps+')';sPathSt.className='sv rec-on';}"
+"    else if(play){sPathSt.textContent='PLAYING ('+steps+')';sPathSt.className='sv ok';}"
+"    else if(steps>0){sPathSt.textContent=steps+' steps stored';sPathSt.className='sv';}"
+"    else{sPathSt.textContent='empty';sPathSt.className='sv';}"
+"  }"
+
+"  var btnRecStart=document.getElementById('btnRecStart');"
+"  var btnPathPlay=document.getElementById('btnPathPlay');"
+"  var btnPathClear=document.getElementById('btnPathClear');"
+"  if(btnRecStart){btnRecStart.classList.toggle('recording',rec);}"
+"  if(btnPathPlay){btnPathPlay.disabled=(steps===0||rec||play||autoRunning);}"
+"  if(btnPathClear){btnPathClear.disabled=(rec||play||autoRunning);}"
+
+"  if(!lastPathRecording&&rec)toast('&#9679; Recording started','rec');"
+"  if(lastPathRecording&&!rec)toast('Recording saved — '+steps+' steps','ok');"
+"  if(!lastPathPlayback&&play)toast('&#9654; Playback started','ok');"
+"  if(lastPathPlayback&&!play&&!autoRunning)toast('Playback complete','ok');"
+"  lastPathRecording=rec;lastPathPlayback=play;"
+"}"
+
 "function setIR(id,stId,blocked){"
 "  var c=document.getElementById(id),s=document.getElementById(stId);"
 "  if(!c||!s)return;"
@@ -533,16 +661,16 @@ static const char HTML_PAGE[] =
 "  var sop=document.getElementById('stopAutoBtn');"
 "  var lk=document.getElementById('autoLockMsg');"
 
-"  if(running){"
+"  if(running||d.path_playback){"
 "    sl.className='auto-state-label running';"
-"    sl.textContent='CLEANING IN PROGRESS...';"
+"    sl.textContent=d.path_playback?'PATH PLAYBACK IN PROGRESS...':'CLEANING IN PROGRESS...';"
 "    if(sast){sast.textContent='RUNNING';sast.className='sv ok';}"
 "    if(sab)sab.style.display='none';"
 "    if(sop)sop.style.display='block';"
 "    if(lk)lk.style.display='block';"
 "  }else if(state==='DONE'){"
 "    sl.className='auto-state-label done';"
-"    sl.textContent='CLEANING COMPLETE ✓';"
+"    sl.textContent='CLEANING COMPLETE \u2713';"
 "    if(sast){sast.textContent='DONE';sast.className='sv ok';}"
 "    if(sab)sab.style.display='block';"
 "    if(sop)sop.style.display='none';"
@@ -559,8 +687,7 @@ static const char HTML_PAGE[] =
 "  if(!lastAutoRunning&&running)toast('Auto clean started','ok');"
 "  if(lastAutoRunning&&!running&&state==='DONE')toast('Auto clean COMPLETE!','ok');"
 "  if(lastAutoRunning&&!running&&state==='IDLE')toast('Auto clean stopped','warn');"
-"  lastAutoRunning=running;"
-"  autoRunning=running;"
+"  lastAutoRunning=running;autoRunning=running;"
 "}"
 
 /* Status poll */
@@ -574,7 +701,11 @@ static const char HTML_PAGE[] =
 "      document.getElementById('pingDot').className=ping<300?'ok':'err';"
 "      document.getElementById('sDir').textContent=d.direction;"
 "      document.getElementById('sTail').textContent=d.tail?'ON':'OFF';"
-"      document.getElementById('sHdg').textContent=(d.heading||0).toFixed(1)+'°';"
+
+"      var hdg=(d.heading||0);"
+"      document.getElementById('sHdg').textContent=hdg.toFixed(2)+'°';"
+"      var gz=(d.gyro_z||0);"
+"      document.getElementById('sGz').textContent=gz.toFixed(3)+' °/s';"
 
 "      setIR('irFL','irFLst',d.ir_fl);"
 "      setIR('irFR','irFRst',d.ir_fr);"
@@ -601,8 +732,11 @@ static const char HTML_PAGE[] =
 "      if(mpuBadge){mpuBadge.textContent=d.mpu_ready?'CONNECTED \u2713':'NOT DETECTED \u2717';"
 "        mpuBadge.className='mpu-ready-badge '+(d.mpu_ready?'ok':'fail');}"
 "      var n=document.getElementById('cNeedle'),h=document.getElementById('cHdg');"
-"      if(n)n.style.transform='rotate('+(d.heading||0)+'deg)';"
-"      if(h)h.textContent=(d.heading||0).toFixed(1)+'\\u00b0';"
+"      if(n)n.style.transform='rotate('+(hdg)+'deg)';"
+"      if(h)h.textContent=hdg.toFixed(2)+'\u00b0';"
+"      var cgz=document.getElementById('cGz');"
+"      if(cgz)cgz.textContent='Gz: '+(gz>=0?'+':'')+gz.toFixed(3)+' \u00b0/s';"
+
 "      var b=document.getElementById('tBubble');"
 "      if(b){var sc=25,dx=Math.max(-sc,Math.min(sc,(d.accel_x||0)*sc)),"
 "        dy=Math.max(-sc,Math.min(sc,-(d.accel_y||0)*sc));"
@@ -612,11 +746,12 @@ static const char HTML_PAGE[] =
 "      setAccelBar('abZ','avZ',d.accel_z||0);"
 "      var vib=d.vib||0;"
 "      var vf=document.getElementById('vibFill'),vv=document.getElementById('vibVal');"
-"      if(vf){vf.style.width=Math.min(100,vib/2*100)+'%';}"
+"      if(vf){var vc=vib<0.1?'var(--accent)':vib<0.5?'var(--warn)':'var(--bad)';"
+"        vf.style.width=Math.min(100,vib/2*100)+'%';vf.style.background=vc;}"
 "      if(vv)vv.textContent=vib.toFixed(3)+' g';"
 "      document.getElementById('sVib').textContent=vib.toFixed(3)+' g';"
 "      var mt=document.getElementById('mpuTemp');"
-"      if(mt)mt.textContent=d.mpu_temp+'\\u00b0C';"
+"      if(mt)mt.textContent=d.mpu_temp+'\u00b0C';"
 
 "      if(d.ramming!=(ramOn?1:0)){ramOn=d.ramming?1:0;updateRamUI();}"
 "      if(d.pump!=(pumpOn?1:0)){pumpOn=d.pump?1:0;updatePumpUI();}"
@@ -627,23 +762,26 @@ static const char HTML_PAGE[] =
 "      document.getElementById('sBlowSt').className='sv '+(d.blower?'blow-on':'ok');"
 
 "      updateAutoUI(d);"
+"      updatePathUI(d);"
 
 "      var l1='Dir: '+(d.direction.substring(0,7)).padEnd(7)+(d.ramming?' RAM':'    ');"
 "      var l2;"
-"      if(d.auto_running)l2='AUTO:'+d.auto_pct+'%  '+d.auto_strips_done+'/'+d.auto_strips_total;"
+"      if(d.path_recording)l2='REC '+d.path_steps+' STEPS      ';"
+"      else if(d.path_playback)l2='PLAYBACK '+d.path_steps+' STEPS';"
+"      else if(d.auto_running)l2='AUTO:'+d.auto_pct+'% '+d.auto_strips_done+'/'+d.auto_strips_total;"
 "      else if(d.pump&&d.blower)l2='PUMP+BLOW ACTIVE';"
 "      else if(d.pump)l2='PUMP ON         ';"
 "      else if(d.blower)l2='BLOWER ON       ';"
 "      else if(d.front_blocked&&d.back_blocked)l2='F&B BLOCKED     ';"
 "      else if(d.front_blocked)l2='FRONT BLOCKED   ';"
 "      else if(d.back_blocked)l2='BACK BLOCKED    ';"
-"      else l2='F:CLR  B:CLR    ';"
+"      else l2='F:CLR  B:CLR  Hdg:'+Math.round(d.heading||0);"
 "      document.getElementById('l1').textContent=l1.padEnd(16).substring(0,16);"
-"      document.getElementById('l2').textContent=l2.padEnd(16).substring(0,16);"
+"      document.getElementById('l2').textContent=(l2||'').padEnd(16).substring(0,16);"
 "    })"
 "    .catch(function(){document.getElementById('pingDot').className='err';});"
 "}"
-"setInterval(pollStatus,500);"
+"setInterval(pollStatus,400);"
 
 /* Sensor Check */
 "function runSensorCheck(){"
@@ -652,7 +790,7 @@ static const char HTML_PAGE[] =
 "  fetch('/sensor_check')"
 "    .then(function(res){return res.json();})"
 "    .then(function(d){"
-"      document.getElementById('roverDims').textContent=d.rover_w_cm+'cm × '+d.rover_d_cm+'cm';"
+"      document.getElementById('roverDims').textContent=d.rover_w_cm+'cm \u00d7 '+d.rover_d_cm+'cm';"
 "      var rows='';"
 "      function row(name,status,note){"
 "        var cls=status==='OK'?'chk-ok':status==='FAIL'?'chk-fail':'chk-na';"
@@ -660,9 +798,9 @@ static const char HTML_PAGE[] =
 "      }"
 "      rows+=row('IR',d.ir_enabled?'OK':'N/A',d.ir_enabled?'IR_ENABLED=1':'IR_ENABLED=0');"
 "      if(d.ir_enabled){"
-"        rows+=row('IR Front-L', d.ir_fl.blocked?'BLOCKED':'CLEAR','Pin '+d.ir_fl.pin);"
+"        rows+=row('IR Front-L',d.ir_fl.blocked?'BLOCKED':'CLEAR','Pin '+d.ir_fl.pin);"
 "        rows+=row('IR Front-R',d.ir_fr.blocked?'BLOCKED':'CLEAR','Pin '+d.ir_fr.pin);"
-"        rows+=row('IR Back-L',  d.ir_bl.blocked?'BLOCKED':'CLEAR','Pin '+d.ir_bl.pin);"
+"        rows+=row('IR Back-L', d.ir_bl.blocked?'BLOCKED':'CLEAR','Pin '+d.ir_bl.pin);"
 "        rows+=row('IR Back-R', d.ir_br.blocked?'BLOCKED':'CLEAR','Pin '+d.ir_br.pin);"
 "      }"
 "      rows+=row('MPU',d.mpu_enabled?'OK':'N/A',d.mpu_enabled?'MPU_ENABLED=1':'MPU_ENABLED=0');"
@@ -671,7 +809,8 @@ static const char HTML_PAGE[] =
 "        if(d.mpu_ready){"
 "          var azOk=Math.abs(d.mpu_accel_z-1.0)<0.3;"
 "          rows+=row('Accel Z',azOk?'OK':'WARN','Expected ~1.0g flat, got '+d.mpu_accel_z.toFixed(3)+'g');"
-"          rows+=row('Temp','OK',d.mpu_temp_c+'\\u00b0C');"
+"          rows+=row('Heading','OK',d.mpu_heading.toFixed(2)+'\u00b0 (relative)');"
+"          rows+=row('Temp','OK',d.mpu_temp_c+'\u00b0C');"
 "        }"
 "      }"
 "      r.innerHTML='<table class=\"chk-table\"><thead><tr><th>SENSOR</th><th>STATUS</th><th>DETAIL</th></tr></thead><tbody>'+rows+'</tbody></table>';"
@@ -686,18 +825,20 @@ static const char HTML_PAGE[] =
 "  var pw=parseInt(document.getElementById('gPW').value)||200;"
 "  var ph=parseInt(document.getElementById('gPH').value)||170;"
 "  var gap=parseInt(document.getElementById('gGap').value)||5;"
-"  var roverW=58,roverD=51;" /* rover dimensions */
-"  var strips=Math.ceil(pw/roverW);"
+"  var roverW=58,roverD=51;"
+"  var strips=Math.ceil(ph/roverW);"  /* strips go along HEIGHT axis */
 "  var totalStrips=strips*cols*rows;"
-"  var estSweepSec=strips*ph*0.15;" /* ~15 ms/cm */
-"  var estTotalSec=estSweepSec*cols*rows+(strips-1)*ph*0.15*cols*rows;" /* rewind time */
+"  var fwdSec=pw*0.015;" /* ~15ms/cm forward */
+"  var stepSec=roverW*0.015;" /* step */
+"  var estSec=(fwdSec+1.5)*strips*cols*rows;" /* +1.5s per step settle */
 "  var calcEl=document.getElementById('calcInfo');"
 "  if(calcEl){"
 "    calcEl.innerHTML="
-"      '<span style=\"color:var(--accent3)\">Rover: '+roverW+'cm × '+roverD+'cm</span><br>'"
+"      '<span style=\"color:var(--accent3)\">Rover: '+roverW+'cm \u00d7 '+roverD+'cm</span><br>'"
 "      +'Strips per panel: '+strips+' (each '+roverW+'cm wide)<br>'"
+"      +'Panel sweep width: '+pw+'cm, height: '+ph+'cm<br>'"
 "      +'Total strips: '+totalStrips+'<br>'"
-"      +'Est. clean time: ~'+Math.round(estTotalSec/60)+' min '+Math.round(estTotalSec%60)+' sec';"
+"      +'Est. clean time: ~'+Math.round(estSec/60)+' min '+Math.round(estSec%60)+' sec';"
 "  }"
 "  drawGrid({cols:cols,rows:rows,pw:pw,ph:ph,gap:gap});"
 "}"
@@ -714,15 +855,15 @@ static const char HTML_PAGE[] =
 "    .then(function(r){return r.json();})"
 "    .then(function(d){"
 "      document.getElementById('gridMsg').textContent="
-"        'Saved: '+d.cols+'\\u00d7'+d.rows+' panels, '+d.total_strips+' strips total';"
-"      toast('Grid saved -- '+d.total_strips+' strips','ok');"
+"        'Saved: '+d.cols+'\u00d7'+d.rows+' panels, '+d.total_strips+' strips total';"
+"      toast('Grid saved \u2014 '+d.total_strips+' strips','ok');"
 "      drawGrid(d);"
 "    })"
 "    .catch(function(){toast('Save failed','err');});"
 "}"
 
 "function startAuto(){"
-"  if(!confirm('Start automatic cleaning?\\n\\nEnsure rover is at TOP-LEFT corner\\nof the first panel, facing DOWN the panel.'))return;"
+"  if(!confirm('Start automatic cleaning?\\n\\nPlace rover at TOP-LEFT of first panel facing DOWN the panel.'))return;"
 "  fetch('/auto')"
 "    .then(function(r){return r.text();})"
 "    .then(function(msg){"
@@ -745,12 +886,12 @@ static const char HTML_PAGE[] =
 "      document.getElementById('gWash').checked=d.wash===1;"
 "      document.getElementById('gBlow').checked=d.blow===1;"
 "      if(d.rover_w_cm)"
-"        document.getElementById('roverDims').textContent=d.rover_w_cm+'cm × '+d.rover_d_cm+'cm';"
+"        document.getElementById('roverDims').textContent=d.rover_w_cm+'cm \u00d7 '+d.rover_d_cm+'cm';"
 "      calcAndDraw();"
 "    }).catch(function(){});"
 "}"
 
-/* Canvas pattern drawing with arrows showing boustrophedon */
+/* Canvas */
 "function drawGrid(d){"
 "  var canvas=document.getElementById('gpCanvas');"
 "  var ctx=canvas.getContext('2d');"
@@ -766,8 +907,8 @@ static const char HTML_PAGE[] =
 "  var totalH=rows*ph+(rows-1)*gap;"
 "  var sc=Math.min((W-20)/totalW,(H-20)/totalH);"
 "  var offX=(W-totalW*sc)/2,offY=(H-totalH*sc)/2;"
-"  var strips=Math.ceil(pw/roverW);"
-"  var sw=pw/strips;" /* display strip width */
+"  var strips=Math.ceil(ph/roverW);"
+"  var sh=ph/strips;"
 
 "  for(var r=0;r<rows;r++){for(var c=0;c<cols;c++){"
 "    var px=offX+(c*(pw+gap))*sc;"
@@ -775,49 +916,36 @@ static const char HTML_PAGE[] =
 "    var pws=pw*sc,phs=ph*sc;"
 "    ctx.fillStyle='rgba(0,60,30,0.5)';ctx.fillRect(px,py,pws,phs);"
 "    ctx.strokeStyle='rgba(0,212,120,0.5)';ctx.lineWidth=1.5;ctx.strokeRect(px,py,pws,phs);"
-
-    /* strip dividers */
 "    ctx.strokeStyle='rgba(0,212,120,0.2)';ctx.lineWidth=0.5;ctx.setLineDash([3,3]);"
-"    for(var s=1;s<strips;s++){"
-"      var sx=px+s*sw*sc;"
-"      ctx.beginPath();ctx.moveTo(sx,py);ctx.lineTo(sx,py+phs);ctx.stroke();"
-"    }"
+"    for(var s=1;s<strips;s++){var sy=py+s*sh*sc;ctx.beginPath();ctx.moveTo(px,sy);ctx.lineTo(px+pws,sy);ctx.stroke();}"
 "    ctx.setLineDash([]);"
-
-    /* draw arrows for each strip */
 "    for(var s=0;s<strips;s++){"
-"      var sx=px+(s+0.5)*sw*sc;"
-"      /* Forward (down) arrow -- green */"
+"      var sy=py+(s+0.5)*sh*sc;"
 "      ctx.strokeStyle='rgba(0,212,120,0.8)';ctx.lineWidth=1.5;"
-"      ctx.beginPath();ctx.moveTo(sx,py+phs*0.15);ctx.lineTo(sx,py+phs*0.85);ctx.stroke();"
-"      ctx.beginPath();ctx.moveTo(sx-4,py+phs*0.75);ctx.lineTo(sx,py+phs*0.85);ctx.lineTo(sx+4,py+phs*0.75);ctx.stroke();"
-
+"      ctx.beginPath();ctx.moveTo(px+pws*0.15,sy);ctx.lineTo(px+pws*0.85,sy);ctx.stroke();"
+"      ctx.beginPath();ctx.moveTo(px+pws*0.75,sy-4);ctx.lineTo(px+pws*0.85,sy);ctx.lineTo(px+pws*0.75,sy+4);ctx.stroke();"
 "      if(s<strips-1){"
-"        /* Backward (up) rewind arrow -- grey */"
-"        var rx=sx+sw*sc*0.3;"
-"        ctx.strokeStyle='rgba(120,140,130,0.5)';ctx.lineWidth=1;"
-"        ctx.beginPath();ctx.moveTo(rx,py+phs*0.85);ctx.lineTo(rx,py+phs*0.15);ctx.stroke();"
-"        ctx.beginPath();ctx.moveTo(rx-3,py+phs*0.25);ctx.lineTo(rx,py+phs*0.15);ctx.lineTo(rx+3,py+phs*0.25);ctx.stroke();"
-"        /* Lateral shift arrow -- blue */"
 "        ctx.strokeStyle='rgba(0,170,255,0.6)';ctx.lineWidth=1;"
-"        var lsx=px+s*sw*sc,lex=px+(s+1)*sw*sc;"
-"        ctx.beginPath();ctx.moveTo(lsx,py+4);ctx.lineTo(lex,py+4);ctx.stroke();"
-"        ctx.beginPath();ctx.moveTo(lex-5,py+1);ctx.lineTo(lex,py+4);ctx.lineTo(lex-5,py+7);ctx.stroke();"
+"        var lsy=py+(s+1)*sh*sc,rex=px+pws;"
+"        ctx.beginPath();ctx.moveTo(rex-4,lsy-6);ctx.lineTo(rex,lsy);ctx.lineTo(rex-4,lsy+6);ctx.stroke();"
+"        ctx.beginPath();ctx.moveTo(rex,sy);ctx.lineTo(rex,lsy);ctx.stroke();"
 "      }"
 "    }"
+"    if(c<cols-1){"
+"      var gapXStart=px+pws,gapXEnd=gapXStart+gap*sc;"
+"      ctx.strokeStyle='rgba(0,170,255,0.5)';ctx.lineWidth=1;ctx.setLineDash([4,2]);"
+"      ctx.beginPath();ctx.moveTo(gapXStart,py+phs/2);ctx.lineTo(gapXEnd,py+phs/2);ctx.stroke();"
+"      ctx.setLineDash([]);"
+"      ctx.beginPath();ctx.moveTo(gapXEnd-5,py+phs/2-3);ctx.lineTo(gapXEnd,py+phs/2);ctx.lineTo(gapXEnd-5,py+phs/2+3);ctx.stroke();"
+"    }"
 "  }}"
-
-"  /* Start marker */"
 "  ctx.fillStyle='#ffcc00';"
 "  ctx.beginPath();ctx.arc(offX+8,offY+8,5,0,2*Math.PI);ctx.fill();"
-
-"  /* Info */"
-"  var estSec=strips*(ph*0.15+ph*0.12)*cols*rows;"
+"  var estSec=strips*(pw*0.015+1.5)*cols*rows;"
 "  document.getElementById('gpInfo').innerHTML="
-"    'Total panels: '+(cols*rows)+'<br>'"
-"    +'Strips/panel: '+strips+' (each ~'+Math.round(pw/strips)+'cm)<br>'"
-"    +'Total W: '+Math.round(totalW/100*10)/10+'m &times; H: '+Math.round(totalH/100*10)/10+'m<br>'"
-"    +'Est. clean: ~'+Math.round(estSec/60)+' min';"
+"    'Total panels: '+(cols*rows)+'  |  Strips/panel: '+strips+'<br>'"
+"    +'Panel: '+pw+'cm wide \u00d7 '+ph+'cm tall<br>'"
+"    +'Est. clean: ~'+Math.round(estSec/60)+' min '+Math.round(estSec%60)+' sec';"
 "}"
 
 "['gCols','gRows','gPW','gPH','gGap'].forEach(function(id){"
@@ -842,7 +970,7 @@ static const char HTML_PAGE[] =
 "  return 'stop';"
 "}"
 "function onStart(e){e.preventDefault();"
-"  if(autoRunning)return;" /* locked */
+"  if(autoRunning||pathPlayback)return;"
 "  active=true;"
 "  var r=joy.getBoundingClientRect();cx=r.left+r.width/2;cy=r.top+r.height/2;"
 "  if(joy.setPointerCapture&&e.pointerId)joy.setPointerCapture(e.pointerId);}"

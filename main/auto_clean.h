@@ -1,59 +1,82 @@
-/*
- * auto_clean.h  —  Fully automatic solar panel cleaning engine
- *
- * Boustrophedon (snake) pattern:
- *   Strip 0: FORWARD (top→bottom), DOWN the panel
- *   Lateral shift RIGHT by ROVER_WIDTH_CM using BACKWARD repositioning
- *   Strip 1: FORWARD again (top→bottom)
- *   ... repeat across panel width
- *   After all strips on one panel column, advance to next column of panels
- *
- * Movement rules:
- *   FORWARD  = used for every cleaning sweep (top→bottom)
- *   BACKWARD = used ONLY for lateral repositioning (rewind to top)
- *   LEFT/RIGHT turning = used for heading correction only
- *   DRIFT_LEFT / DRIFT_RIGHT = used for minor straight-line corrections
- *
- * Pump:   ON during all forward cleaning sweeps
- * Blower: ON during forward sweeps, OFF during backward rewind
- */
-
 #pragma once
+
+#include "motor.h"
 #include <stdbool.h>
 
-/* ─── Grid configuration (set via web UI / set_grid endpoint) ─ */
+/* ─── Grid configuration ─────────────────────────────────── */
+
 typedef struct {
-    int  panel_cols;        /* number of panel columns in the array */
-    int  panel_rows;        /* number of panel rows in the array */
-    int  panel_w_cm;        /* panel width  (lateral, perpendicular to cleaning direction) */
-    int  panel_h_cm;        /* panel height (along cleaning direction, top→bottom) */
-    int  gap_between_cm;    /* gap between adjacent panels in the array */
-    bool wash_enabled;      /* true = pump on during sweeps */
-    bool blow_enabled;      /* true = blower on during sweeps */
+    int  panel_cols;        /* number of panels side-by-side horizontally  */
+    int  panel_rows;        /* number of panels stacked vertically         */
+    int  panel_w_cm;        /* width  of one panel (the axis rover sweeps) */
+    int  panel_h_cm;        /* height of one panel (rover steps along it)  */
+    int  gap_between_cm;    /* gap between adjacent panels                 */
+    bool wash_enabled;      /* activate pump during cleaning               */
+    bool blow_enabled;      /* activate blower during cleaning             */
 } clean_grid_t;
 
-/* ─── State ───────────────────────────────────────────────── */
+/* ─── State machine ──────────────────────────────────────── */
+
 typedef enum {
-    CLEAN_IDLE = 0,
-    CLEAN_RUNNING,
-    CLEAN_PAUSED,
-    CLEAN_DONE,
-    CLEAN_ERROR,
+    CLEAN_IDLE    = 0,
+    CLEAN_RUNNING = 1,
+    CLEAN_DONE    = 2,
+    CLEAN_ERROR   = 3,
 } clean_state_t;
 
-/* ─── Public API ──────────────────────────────────────────── */
+/* ─── Grid API ───────────────────────────────────────────── */
 
-/* Configure the grid (called from web_server set_grid handler) */
-void auto_clean_set_grid(const clean_grid_t *g);
-void auto_clean_get_grid(clean_grid_t *g);
+void          auto_clean_set_grid   (const clean_grid_t *g);
+void          auto_clean_get_grid   (clean_grid_t *g);
 
-/* Start / stop */
-bool auto_clean_start(void);   /* returns false if already running */
-void auto_clean_stop(void);    /* request graceful stop */
+/* ─── Auto-clean API ─────────────────────────────────────── */
 
-/* Query */
-clean_state_t auto_clean_state(void);
-bool          auto_clean_is_running(void);
-int           auto_clean_strips_done(void);   /* strips completed so far */
-int           auto_clean_strips_total(void);  /* total strips to clean */
-int           auto_clean_pct(void);           /* 0–100 */
+bool          auto_clean_start      (void);
+void          auto_clean_stop       (void);
+
+clean_state_t auto_clean_state      (void);
+bool          auto_clean_is_running (void);
+int           auto_clean_strips_done(void);
+int           auto_clean_strips_total(void);
+int           auto_clean_pct        (void);
+
+/* ─── Path recording / playback API ─────────────────────── */
+
+/**
+ * Start capturing every manual move command into an internal path buffer.
+ * Returns false if auto-clean or playback is already running.
+ */
+bool  auto_path_record_start    (void);
+
+/**
+ * Call this from web_server whenever a manual /move command arrives.
+ * The recording engine timestamps and stores each segment.
+ */
+void  auto_path_record_cmd      (motor_dir_t dir);
+
+/**
+ * Call this when pump/blower state changes during recording.
+ * is_pump=true → pump event, false → blower event.
+ */
+void  auto_path_record_peripheral(bool is_pump, bool on);
+
+/**
+ * Finalise recording.  After this, auto_path_play_start() may be called.
+ */
+void  auto_path_record_stop     (void);
+
+/**
+ * Erase the stored path.
+ */
+void  auto_path_clear           (void);
+
+/**
+ * Start replaying the recorded path.
+ * Returns false if no path is stored or something is already running.
+ */
+bool  auto_path_play_start      (void);
+
+/* State queries */
+bool  auto_path_recording       (void);
+bool  auto_path_playback        (void);
+int   auto_path_len             (void);
