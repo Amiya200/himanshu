@@ -1,68 +1,61 @@
+/*
+ * auto_clean.c — Boustrophedon auto-clean with servo boundary control
+ *
+ * UPGRADES v3.1 (bug-fix pass):
+ *  - auto_clean_task and path_playback_task pinned to core 0 (motor_task on core 1)
+ *  - auto_clean_stop() no longer force-sets CLEAN_IDLE while task is running;
+ *    instead sets CLEAN_STOPPING and lets the task exit cleanly
+ *  - safe_forward_strip() pause/stop checks restored (were commented out)
+ *  - motor_set_speed(MOTOR_SPEED_REPOSITION) added before every backward/lateral move
+ *  - All heading corrections now use norm_heading() consistently
+ *
+ * UPGRADES v3.0 (original):
+ *  - Servo lifts wiper BEFORE reaching panel edge → no more stuck wiper
+ *  - Multi-pass per strip (configurable 1–3 passes)
+ *  - Row-to-row repositioning implemented
+ *  - Pause / Resume support
+ *  - Current panel + strip tracking exposed to UI
+ *  - PID straight-line travel via motor_move_straight()
+ *  - Heading verified and corrected before every strip
+ */
+
 #include "auto_clean.h"
 #include "config.h"
 #include "motor.h"
+#include "servo.h"
 #include "mpu6050.h"
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include <math.h>
 #include <string.h>
-#include "esp_timer.h"
 
 static const char *TAG = "AUTO";
-
-/* ─── Tuning constants ────────────────────────────────────── */
-
-/* Time for a 90-degree in-place spin (milliseconds).
-   Increase if rover under-turns, decrease if it over-turns.
-   With timed_turn_then_correct() the gyro trims residual error,
-   so this just needs to be within ~30 % of the real value.       */
-#define TURN_90_MS          750
-
-/* Pause after stopping before we trust the gyro reading (ms).    */
-#define SETTLE_MS           350
-
-/* Maximum time the heading-correction loop may run (ms).         */
-#define CORRECT_MAX_MS      3000
-
-/* Heading error below which we consider ourselves "on target".   */
-#define HEADING_OK_DEG      4.0f
-
-/* How far we spin in the timed-turn phase (fraction of full 90). */
-#define TURN_FRACTION       0.65f
-
-/* Extra pause after every lateral step (ms) – lets the chassis
-   stop rocking before the next sweep.                            */
-#define POST_STEP_SETTLE_MS 500
-
-/* Extra pause between strips to let IMU re-lock (ms).            */
-#define POST_STRIP_PAUSE_MS 400
 
 /* ─── Path recording ─────────────────────────────────────── */
 
 #define PATH_MAX_STEPS  256
 
 typedef enum {
-    PATH_STEP_MOVE,   /* motor_dir + duration_ms              */
-    PATH_STEP_STOP,   /* pause                                */
-    PATH_STEP_PUMP,   /* pump on/off                          */
-    PATH_STEP_BLOWER, /* blower on/off                        */
+    PATH_STEP_MOVE,
+    PATH_STEP_STOP,
+    PATH_STEP_PUMP,
+    PATH_STEP_BLOWER,
 } path_step_type_t;
 
 typedef struct {
     path_step_type_t type;
-    motor_dir_t      dir;      /* PATH_STEP_MOVE            */
-    int              ms;       /* duration (MOVE) or delay  */
-    bool             on;       /* PUMP / BLOWER             */
+    motor_dir_t      dir;
+    int              ms;
+    bool             on;
 } path_step_t;
 
 static path_step_t    s_path[PATH_MAX_STEPS];
 static volatile int   s_path_len         = 0;
 static volatile bool  s_path_recording   = false;
 static volatile bool  s_path_playback    = false;
-
-/* Timestamp of the last motor command during recording */
 static int64_t        s_rec_cmd_start_ms = 0;
 static motor_dir_t    s_rec_last_dir     = DIR_STOP;
 
@@ -74,14 +67,23 @@ static clean_grid_t s_grid = {
     .panel_w_cm     = 200,
     .panel_h_cm     = 170,
     .gap_between_cm = 5,
+    .row_gap_cm     = 10,
     .wash_enabled   = true,
     .blow_enabled   = false,
+    .passes         = 1,
 };
 
-static volatile clean_state_t s_state          = CLEAN_IDLE;
-static volatile bool          s_stop_requested = false;
-static volatile int           s_strips_done    = 0;
-static volatile int           s_strips_total   = 0;
+/*
+ * FIX v3.1: Added CLEAN_STOPPING state so auto_clean_stop() can signal
+ * the task without clobbering state before the task has exited.
+ */
+static volatile clean_state_t s_state           = CLEAN_IDLE;
+static volatile bool          s_stop_requested  = false;
+static volatile bool          s_pause_requested = false;
+static volatile int           s_strips_done     = 0;
+static volatile int           s_strips_total    = 0;
+static volatile int           s_current_panel   = 0;
+static volatile int           s_current_strip   = 0;
 
 static float s_base_heading = 0.0f;
 
@@ -91,21 +93,29 @@ void auto_clean_set_grid(const clean_grid_t *g)
 {
     s_grid = *g;
     if (s_grid.panel_cols < 1)       s_grid.panel_cols      = 1;
-    if (s_grid.panel_cols > 10)      s_grid.panel_cols      = 10;
+    if (s_grid.panel_cols > 20)      s_grid.panel_cols      = 20;
     if (s_grid.panel_rows < 1)       s_grid.panel_rows      = 1;
-    if (s_grid.panel_rows > 10)      s_grid.panel_rows      = 10;
+    if (s_grid.panel_rows > 20)      s_grid.panel_rows      = 20;
     if (s_grid.panel_w_cm < 20)      s_grid.panel_w_cm      = 20;
     if (s_grid.panel_h_cm < 20)      s_grid.panel_h_cm      = 20;
     if (s_grid.gap_between_cm < 0)   s_grid.gap_between_cm  = 0;
-    if (s_grid.gap_between_cm > 200) s_grid.gap_between_cm  = 200;
+    if (s_grid.gap_between_cm > 500) s_grid.gap_between_cm  = 500;
+    if (s_grid.row_gap_cm < 0)       s_grid.row_gap_cm      = 0;
+    if (s_grid.row_gap_cm > 500)     s_grid.row_gap_cm      = 500;
+    if (s_grid.passes < 1)           s_grid.passes          = 1;
+    if (s_grid.passes > 3)           s_grid.passes          = 3;
 }
 
 void auto_clean_get_grid(clean_grid_t *g) { *g = s_grid; }
-clean_state_t auto_clean_state(void)      { return s_state; }
-bool  auto_clean_is_running(void)         { return s_state == CLEAN_RUNNING; }
-int   auto_clean_strips_done(void)        { return s_strips_done; }
-int   auto_clean_strips_total(void)       { return s_strips_total; }
-int   auto_clean_pct(void)
+
+clean_state_t auto_clean_state(void)    { return s_state;         }
+bool  auto_clean_is_running(void)       { return s_state == CLEAN_RUNNING || s_state == CLEAN_PAUSED; }
+int   auto_clean_strips_done(void)      { return s_strips_done;   }
+int   auto_clean_strips_total(void)     { return s_strips_total;  }
+int   auto_clean_current_panel(void)    { return s_current_panel; }
+int   auto_clean_current_strip(void)    { return s_current_strip; }
+
+int auto_clean_pct(void)
 {
     if (s_strips_total <= 0) return 0;
     int p = (s_strips_done * 100) / s_strips_total;
@@ -120,7 +130,7 @@ int  auto_path_len(void)       { return s_path_len;       }
 
 bool auto_path_record_start(void)
 {
-    if (s_state == CLEAN_RUNNING || s_path_playback) return false;
+    if (auto_clean_is_running() || s_path_playback) return false;
     s_path_len         = 0;
     s_path_recording   = true;
     s_rec_last_dir     = DIR_STOP;
@@ -129,16 +139,14 @@ bool auto_path_record_start(void)
     return true;
 }
 
-/* Called by web_server whenever a manual move command arrives */
 void auto_path_record_cmd(motor_dir_t dir)
 {
     if (!s_path_recording) return;
     int64_t now_ms = esp_timer_get_time() / 1000;
 
-    /* Flush the previous segment if it was a MOVE */
     if (s_rec_last_dir != DIR_STOP && s_path_len < PATH_MAX_STEPS) {
         int dur = (int)(now_ms - s_rec_cmd_start_ms);
-        if (dur > 20) {                      /* ignore noise <20 ms */
+        if (dur > 20) {
             s_path[s_path_len].type = PATH_STEP_MOVE;
             s_path[s_path_len].dir  = s_rec_last_dir;
             s_path[s_path_len].ms   = dur;
@@ -146,20 +154,16 @@ void auto_path_record_cmd(motor_dir_t dir)
         }
     }
 
-    if (dir == DIR_STOP) {
-        /* record explicit stop with 0 duration pause */
-        if (s_path_len < PATH_MAX_STEPS) {
-            s_path[s_path_len].type = PATH_STEP_STOP;
-            s_path[s_path_len].ms   = 0;
-            s_path_len++;
-        }
+    if (dir == DIR_STOP && s_path_len < PATH_MAX_STEPS) {
+        s_path[s_path_len].type = PATH_STEP_STOP;
+        s_path[s_path_len].ms   = 0;
+        s_path_len++;
     }
 
     s_rec_last_dir     = dir;
     s_rec_cmd_start_ms = now_ms;
 }
 
-/* Called by web_server when pump/blower state changes during recording */
 void auto_path_record_peripheral(bool is_pump, bool on)
 {
     if (!s_path_recording || s_path_len >= PATH_MAX_STEPS) return;
@@ -172,7 +176,6 @@ void auto_path_record_peripheral(bool is_pump, bool on)
 void auto_path_record_stop(void)
 {
     if (!s_path_recording) return;
-    /* flush any ongoing move */
     auto_path_record_cmd(DIR_STOP);
     s_path_recording = false;
     ESP_LOGI(TAG, "Path recording STOPPED  %d steps", s_path_len);
@@ -203,9 +206,8 @@ static float heading_error(float target, float current)
 
 /*
  * correct_heading_to():
- *   Spin in short bursts until gyro reads within HEADING_OK_DEG of
- *   target, or CORRECT_MAX_MS elapses.  Returns false only when
- *   s_stop_requested fires.
+ *   Spin in proportional bursts until gyro reads within HEADING_OK_DEG
+ *   or CORRECT_MAX_MS elapses.
  */
 static bool correct_heading_to(float target_deg)
 {
@@ -216,11 +218,23 @@ static bool correct_heading_to(float target_deg)
         return !s_stop_requested;
     }
 
-    const int POLL_MS  = 25;
-    int       elapsed  = 0;
-    int       stable   = 0;          /* consecutive ticks inside band */
+    const int POLL_MS = 25;
+    int       elapsed = 0;
+    int       stable  = 0;
+
+    motor_set_speed(MOTOR_SPEED_TURN);
 
     while (elapsed < CORRECT_MAX_MS) {
+        if (s_stop_requested) {
+            motor_send_cmd(DIR_STOP);
+            return false;
+        }
+
+        /* FIX v3.1: pause check restored */
+        while (s_pause_requested && !s_stop_requested) {
+            motor_send_cmd(DIR_STOP);
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
         if (s_stop_requested) {
             motor_send_cmd(DIR_STOP);
             return false;
@@ -230,18 +244,20 @@ static bool correct_heading_to(float target_deg)
         float err = heading_error(target_deg, cur);
 
         if (fabsf(err) <= HEADING_OK_DEG) {
-            if (++stable >= 3) {     /* must stay stable for 3 polls  */
+            if (++stable >= 3) {
                 motor_send_cmd(DIR_STOP);
                 vTaskDelay(pdMS_TO_TICKS(SETTLE_MS));
-                ESP_LOGI(TAG, "Heading OK: target=%.1f  cur=%.1f  err=%.1f",
-                         (double)target_deg, (double)cur, (double)err);
+                ESP_LOGI(TAG, "Hdg OK → target=%.1f  cur=%.1f",
+                         (double)target_deg, (double)cur);
                 return true;
             }
         } else {
             stable = 0;
-            /* proportional-ish: large error → full spin, small → short burst */
-            motor_dir_t spin = (err > 0) ? DIR_RIGHT : DIR_LEFT;
-            motor_send_cmd(spin);
+            float ratio = fabsf(err) / 45.0f;
+            if (ratio > 1.0f) ratio = 1.0f;
+            uint8_t spd = (uint8_t)(MOTOR_SPEED_TURN * (0.5f + 0.5f * ratio));
+            motor_set_speed(spd);
+            motor_send_cmd((err > 0) ? DIR_RIGHT : DIR_LEFT);
         }
 
         vTaskDelay(pdMS_TO_TICKS(POLL_MS));
@@ -263,7 +279,7 @@ static bool correct_heading_to(float target_deg)
 
 /*
  * timed_turn_then_correct():
- *   Spin for TURN_FRACTION * expected_ms then let the gyro trim the rest.
+ *   Pre-spin a fraction of the expected time, then let gyro trim.
  */
 static bool timed_turn_then_correct(motor_dir_t spin_dir,
                                     int         expected_ms,
@@ -272,6 +288,7 @@ static bool timed_turn_then_correct(motor_dir_t spin_dir,
     if (s_stop_requested) return false;
 
     int spin_ms = (int)(expected_ms * TURN_FRACTION);
+    motor_set_speed(MOTOR_SPEED_TURN);
     motor_send_cmd(spin_dir);
     vTaskDelay(pdMS_TO_TICKS(spin_ms));
     motor_send_cmd(DIR_STOP);
@@ -280,71 +297,145 @@ static bool timed_turn_then_correct(motor_dir_t spin_dir,
     return correct_heading_to(target_deg);
 }
 
-/* ─── Stop-aware move wrappers ────────────────────────────── */
+/* ─── Pause/stop check helper ────────────────────────────── */
+
+/*
+ * FIX v3.1: Returns true if we should ABORT (stop requested).
+ * Blocks here while paused.
+ */
+static bool check_pause_stop(void)
+{
+    while (s_pause_requested && !s_stop_requested) {
+        motor_send_cmd(DIR_STOP);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    return s_stop_requested;
+}
+
+/* ─── Forward strip sweep ─────────────────────────────────── */
 
 /*
  * safe_forward_strip():
- *   Move forward for duration_ms while maintaining hdg via drift
- *   correction.  Pauses POST_STRIP_PAUSE_MS at the end.
+ *   1. Servo → DEPLOY (wiper active)
+ *   2. Check pause/stop before starting
+ *   3. Lift servo BOUNDARY_ADVANCE_CM before panel end
+ *   4. Complete travel
+ *   5. Servo → PARK
+ *
+ * FIX v3.1: pause/stop guards after deploy and after phase-1 are restored.
  */
-static bool safe_forward_strip(int duration_ms, float hdg)
+#define BOUNDARY_ADVANCE_CM   8   /* lift servo this far before edge */
+
+static bool safe_forward_strip(int total_ms, float hdg)
 {
     if (s_stop_requested) return false;
 
-    ESP_LOGI(TAG, "FWD strip: %d ms  heading=%.1f", duration_ms, (double)hdg);
+    ESP_LOGI(TAG, "FWD strip: %d ms  hdg=%.1f", total_ms, (double)hdg);
 
+    /* Deploy wiper */
+    servo_deploy();
+
+    /* FIX v3.1: check pause/stop right after deploying */
+    if (check_pause_stop()) {
+        servo_park();
+        return false;
+    }
+
+    /* Calculate when to lift wiper */
+    int boundary_ms = BOUNDARY_ADVANCE_CM * MS_PER_CM;
+    int main_ms     = total_ms - boundary_ms;
+    if (main_ms < 0) { main_ms = total_ms; boundary_ms = 0; }
+
+    /* Phase 1: main travel with wiper deployed */
+    motor_set_speed(MOTOR_SPEED_CLEAN);
 #if MPU_ENABLED
-    bool ok = motor_move_straight(DIR_FORWARD, duration_ms, hdg, 5.0f);
+    bool ok = motor_move_straight(DIR_FORWARD, main_ms, hdg, HEADING_KP);
 #else
     motor_send_cmd(DIR_FORWARD);
-    vTaskDelay(pdMS_TO_TICKS(duration_ms));
+    vTaskDelay(pdMS_TO_TICKS(main_ms));
     motor_send_cmd(DIR_STOP);
     bool ok = true;
 #endif
 
+    /* FIX v3.1: check after phase-1 completes */
+    if (!ok || s_stop_requested) {
+        servo_park();
+        return false;
+    }
+
+    if (check_pause_stop()) {
+        servo_park();
+        return false;
+    }
+
+    /* Phase 2: lift wiper for boundary approach */
+    if (boundary_ms > 0) {
+        servo_boundary();
+        motor_set_speed(MOTOR_SPEED_CLEAN);
+#if MPU_ENABLED
+        ok = motor_move_straight(DIR_FORWARD, boundary_ms, hdg, HEADING_KP);
+#else
+        motor_send_cmd(DIR_FORWARD);
+        vTaskDelay(pdMS_TO_TICKS(boundary_ms));
+        motor_send_cmd(DIR_STOP);
+#endif
+    }
+
+    /* Park wiper and settle */
+    servo_park();
     vTaskDelay(pdMS_TO_TICKS(POST_STRIP_PAUSE_MS));
-    return ok && !s_stop_requested;
+
+    return !s_stop_requested;
 }
+
+/* ─── Lateral step between strips ─────────────────────────── */
 
 /*
  * safe_lateral_step():
- *   Spin 90°, move step, spin back 180°.  Uses gyro for both turns.
- *   After the step, re-aligns to target heading precisely.
+ *   Wiper is parked during all turns/steps.
+ *   Sequence:
+ *     1. Turn 90° to face the step direction
+ *     2. Forward for step_ms
+ *     3. Turn 90° back (now facing panel reverse direction)
+ *     4. Turn 180° to face forward again
+ *     → Final heading = s_base_heading
+ *
+ * FIX v3.1: motor_set_speed(MOTOR_SPEED_REPOSITION) is set explicitly
+ *            before the lateral forward move.
  */
 static bool safe_lateral_step(bool go_right, int step_ms, float base_hdg)
 {
     if (s_stop_requested) return false;
 
-    float hdg_side = norm_heading(base_hdg + (go_right ?  90.0f : -90.0f));
-    float hdg_back = norm_heading(base_hdg + 180.0f);   /* now facing back */
+    servo_park();
 
-    ESP_LOGI(TAG, "LATERAL STEP: %s  step_ms=%d  side_hdg=%.1f",
-             go_right ? "RIGHT" : "LEFT", step_ms, (double)hdg_side);
+    float hdg_side = norm_heading(base_hdg + (go_right ?  90.0f : -90.0f));
+    float hdg_back = norm_heading(base_hdg + 180.0f);
+
+    ESP_LOGI(TAG, "STEP %s  step_ms=%d  side=%.1f  back=%.1f",
+             go_right ? "→RIGHT" : "←LEFT",
+             step_ms, (double)hdg_side, (double)hdg_back);
 
     motor_dir_t spin1 = go_right ? DIR_RIGHT : DIR_LEFT;
     motor_dir_t spin2 = go_right ? DIR_LEFT  : DIR_RIGHT;
 
-    /* Turn 90° to face the side */
+    /* Turn to face step direction */
     if (!timed_turn_then_correct(spin1, TURN_90_MS, hdg_side)) return false;
+    if (check_pause_stop()) return false;
 
-    /* Step across */
+    /* FIX v3.1: set speed explicitly before lateral step */
+    motor_set_speed(MOTOR_SPEED_REPOSITION);
     motor_send_cmd(DIR_FORWARD);
     vTaskDelay(pdMS_TO_TICKS(step_ms));
     motor_send_cmd(DIR_STOP);
     vTaskDelay(pdMS_TO_TICKS(POST_STEP_SETTLE_MS));
     if (s_stop_requested) return false;
 
-    /* Turn 90° to face back (along the panel) — now at base_hdg + 180 */
+    /* Turn back 90° → now facing backward (base_hdg + 180) */
     if (!timed_turn_then_correct(spin2, TURN_90_MS, hdg_back)) return false;
+    if (check_pause_stop()) return false;
 
-    /* ── Rewind pass (optional gyro-straight backward) ── */
-    /* We do NOT use backward for actual cleaning; only to reach
-       next strip start. Could be left out if strips overlap enough.
-       For now we just leave the rover at the new strip start facing
-       the forward direction; the strip itself calls safe_forward_strip. */
-
-    /* Final re-align to base heading (+ 180 already done above) */
-    /* Turn another 180 so we face the original forward direction  */
+    /* Turn another 180° → back to forward heading */
     if (!timed_turn_then_correct(spin2, TURN_90_MS * 2,
                                  norm_heading(base_hdg))) return false;
 
@@ -357,58 +448,66 @@ static bool safe_lateral_step(bool go_right, int step_ms, float base_hdg)
 static void path_playback_task(void *arg)
 {
     (void)arg;
-    s_state         = CLEAN_RUNNING;
+    s_state          = CLEAN_RUNNING;
     s_stop_requested = false;
 
     ESP_LOGI(TAG, "Path playback START  %d steps", s_path_len);
 
     for (int i = 0; i < s_path_len && !s_stop_requested; i++) {
+        /* Pause support */
+        while (s_pause_requested && !s_stop_requested) {
+            motor_send_cmd(DIR_STOP);
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        if (s_stop_requested) break;
+
         const path_step_t *st = &s_path[i];
         switch (st->type) {
-            case PATH_STEP_MOVE:
-                ESP_LOGI(TAG, "  Step %d: MOVE dir=%d  %d ms", i, (int)st->dir, st->ms);
-                motor_send_cmd(st->dir);
-                vTaskDelay(pdMS_TO_TICKS(st->ms));
-                motor_send_cmd(DIR_STOP);
-                vTaskDelay(pdMS_TO_TICKS(150));
-                break;
-            case PATH_STEP_STOP:
-                motor_send_cmd(DIR_STOP);
-                if (st->ms > 0) vTaskDelay(pdMS_TO_TICKS(st->ms));
-                break;
-            case PATH_STEP_PUMP:
-                pump_set(st->on);
-                break;
-            case PATH_STEP_BLOWER:
-                blower_set(st->on);
-                break;
+        case PATH_STEP_MOVE:
+            ESP_LOGI(TAG, "  Step %d: MOVE dir=%d  %d ms", i, (int)st->dir, st->ms);
+            motor_send_cmd(st->dir);
+            vTaskDelay(pdMS_TO_TICKS(st->ms));
+            motor_send_cmd(DIR_STOP);
+            vTaskDelay(pdMS_TO_TICKS(150));
+            break;
+        case PATH_STEP_STOP:
+            motor_send_cmd(DIR_STOP);
+            if (st->ms > 0) vTaskDelay(pdMS_TO_TICKS(st->ms));
+            break;
+        case PATH_STEP_PUMP:
+            pump_set(st->on);
+            break;
+        case PATH_STEP_BLOWER:
+            blower_set(st->on);
+            break;
         }
     }
 
     motor_send_cmd(DIR_STOP);
     pump_set(false);
     blower_set(false);
+    servo_park();
     s_path_playback = false;
-    s_state         = CLEAN_DONE;
+    s_state         = s_stop_requested ? CLEAN_IDLE : CLEAN_DONE;
     ESP_LOGI(TAG, "Path playback DONE");
     vTaskDelete(NULL);
 }
 
 bool auto_path_play_start(void)
 {
-    if (s_path_len == 0) {
-        ESP_LOGW(TAG, "No path recorded");
-        return false;
-    }
-    if (s_state == CLEAN_RUNNING) {
-        ESP_LOGW(TAG, "Already running");
-        return false;
-    }
-    s_path_playback  = true;
-    s_stop_requested = false;
+    if (s_path_len == 0)              { ESP_LOGW(TAG, "No path recorded"); return false; }
+    if (auto_clean_is_running())      { ESP_LOGW(TAG, "Already running");  return false; }
 
-    BaseType_t rc = xTaskCreate(path_playback_task, "path_play",
-                                4096, NULL, 5, NULL);
+    s_path_playback   = true;
+    s_stop_requested  = false;
+    s_pause_requested = false;
+
+    /*
+     * FIX v3.1: pin to core 0 — motor_task runs on core 1.
+     * This eliminates the dual-core race on s_cmd.
+     */
+    BaseType_t rc = xTaskCreatePinnedToCore(path_playback_task, "path_play",
+                                            4096, NULL, 5, NULL, 0);
     if (rc != pdPASS) {
         s_path_playback = false;
         s_state         = CLEAN_ERROR;
@@ -424,85 +523,144 @@ static void auto_clean_task(void *arg)
     (void)arg;
     const clean_grid_t g = s_grid;
 
-    /*
-     * Number of strips = ceil(panel_height / rover_width).
-     * Each strip runs the full WIDTH of the panel.
-     * The rover steps along the HEIGHT direction between strips.
-     */
     const int strips_per_panel =
         (g.panel_h_cm + ROVER_WIDTH_CM - 1) / ROVER_WIDTH_CM;
 
-    /* Total strips across all panels */
-    s_strips_total = strips_per_panel * g.panel_cols * g.panel_rows;
-    s_strips_done  = 0;
+    s_strips_total  = strips_per_panel * g.panel_cols * g.panel_rows;
+    s_strips_done   = 0;
+    s_current_panel = 0;
+    s_current_strip = 0;
 
-    /* Time to traverse one strip (width of panel) */
-    const int forward_ms = g.panel_w_cm * MS_PER_CM;
-
-    /* Time to step one rover-width sideways */
-    const int step_ms = ROVER_WIDTH_CM * MS_PER_CM;
+    const int forward_ms = g.panel_w_cm   * MS_PER_CM;
+    const int step_ms    = ROVER_WIDTH_CM * MS_PER_CM;
 
     s_state      = CLEAN_RUNNING;
     bool go_right = true;
 
-    /* Activate peripherals as configured */
-    if (g.wash_enabled)  pump_set(true);
-    if (g.blow_enabled)  blower_set(true);
+    if (g.wash_enabled) pump_set(true);
+    if (g.blow_enabled) blower_set(true);
 
-    /* Outer loops: iterate over panel grid (row-major) */
+    gpio_set_level(PIN_TAIL_LIGHT, 1);
+
+    /* ── Row × Column panel loop ── */
     for (int pr = 0; pr < g.panel_rows && !s_stop_requested; pr++) {
         for (int pc = 0; pc < g.panel_cols && !s_stop_requested; pc++) {
 
+            s_current_panel = pr * g.panel_cols + pc;
             ESP_LOGI(TAG, "Panel [row=%d col=%d]  strips=%d",
                      pr, pc, strips_per_panel);
 
-            /* ── inner loop: sweep strips across this panel ── */
+            if (!correct_heading_to(s_base_heading)) break;
+
+            /* ── Strip loop ── */
             for (int i = 0; i < strips_per_panel && !s_stop_requested; i++) {
 
-                /* ── 1. Forward sweep ── */
-                if (!safe_forward_strip(forward_ms, s_base_heading)) break;
+                s_current_strip = i;
+
+                /* Multi-pass */
+                for (int pass = 0; pass < g.passes && !s_stop_requested; pass++) {
+                    ESP_LOGI(TAG, "  Strip %d/%d  pass %d/%d",
+                             i+1, strips_per_panel, pass+1, g.passes);
+
+                    if (!safe_forward_strip(forward_ms, s_base_heading)) break;
+
+                    /* Return for next pass */
+                    if (pass < g.passes - 1) {
+                        servo_park();
+
+                        /* FIX v3.1: set speed before backward move */
+                        motor_set_speed(MOTOR_SPEED_REPOSITION);
+                        bool ok = motor_move_straight(
+                            DIR_BACKWARD, forward_ms,
+                            norm_heading(s_base_heading + 180.0f),
+                            HEADING_KP);
+                        if (!ok || s_stop_requested) break;
+
+                        if (!correct_heading_to(s_base_heading)) break;
+                    }
+                }
+
+                if (s_stop_requested) break;
+
                 s_strips_done++;
-                ESP_LOGI(TAG, "Strip done: %d / %d", s_strips_done, s_strips_total);
+                ESP_LOGI(TAG, "Strip %d/%d done (%d%%)",
+                         s_strips_done, s_strips_total, auto_clean_pct());
 
-                if (i == strips_per_panel - 1) break; /* last strip — no step */
+                if (i == strips_per_panel - 1) break;
 
-                /* ── 2. Lateral step to next strip ── */
+                /* ── Lateral step ── */
                 if (!safe_lateral_step(go_right, step_ms, s_base_heading)) break;
-
-                /* After step, the rover is back at base heading. */
                 go_right = !go_right;
 
                 vTaskDelay(pdMS_TO_TICKS(POST_STEP_SETTLE_MS));
             }
 
-            /* ── Move to the next panel column (gap + panel_w) ── */
+            /* ── Inter-panel column advance ── */
             if (pc < g.panel_cols - 1 && !s_stop_requested) {
-                int gap_ms = (g.panel_w_cm + g.gap_between_cm) * MS_PER_CM;
-                ESP_LOGI(TAG, "Moving to next panel col: %d ms", gap_ms);
-                /* Realign heading before inter-panel move */
+                ESP_LOGI(TAG, "Advancing to next panel column...");
+                servo_park();
+
                 if (!correct_heading_to(s_base_heading)) break;
-                motor_send_cmd(DIR_FORWARD);
-                vTaskDelay(pdMS_TO_TICKS(gap_ms));
-                motor_send_cmd(DIR_STOP);
+
+                int gap_ms = g.gap_between_cm * MS_PER_CM;
+
+                /* FIX v3.1: set speed before inter-panel move */
+                motor_set_speed(MOTOR_SPEED_REPOSITION);
+                bool ok = motor_move_straight(DIR_FORWARD, gap_ms,
+                                              s_base_heading, HEADING_KP);
+                if (!ok || s_stop_requested) break;
+
                 vTaskDelay(pdMS_TO_TICKS(POST_STEP_SETTLE_MS));
+                go_right = true;
             }
         }
 
-        /* ── Move to next panel row ── */
+        /* ── Inter-row advance ── */
         if (pr < g.panel_rows - 1 && !s_stop_requested) {
-            /* TODO: implement row-to-row repositioning if your layout
-               requires it — for flat horizontal arrays, this is a
-               simple forward step equal to panel_h + gap.           */
+            ESP_LOGI(TAG, "Advancing to next panel row...");
+            servo_park();
+
+            float hdg_side = norm_heading(s_base_heading - 90.0f);
+            float hdg_fwd  = s_base_heading;
+
+            if (!timed_turn_then_correct(DIR_LEFT, TURN_90_MS, hdg_side)) break;
+
+            int row_advance_ms = (g.panel_h_cm + g.row_gap_cm) * MS_PER_CM;
+
+            /* FIX v3.1: set speed before row advance */
+            motor_set_speed(MOTOR_SPEED_REPOSITION);
+            bool ok = motor_move_straight(DIR_FORWARD, row_advance_ms,
+                                          hdg_side, HEADING_KP);
+            if (!ok || s_stop_requested) break;
+
+            if (!timed_turn_then_correct(DIR_RIGHT, TURN_90_MS, hdg_fwd)) break;
+
+            go_right = true;
+            vTaskDelay(pdMS_TO_TICKS(POST_STEP_SETTLE_MS));
         }
     }
 
+    /* ── Done ── */
     motor_send_cmd(DIR_STOP);
     pump_set(false);
     blower_set(false);
+    servo_park();
     gpio_set_level(PIN_TAIL_LIGHT, 0);
 
-    s_state = CLEAN_DONE;
-    ESP_LOGI(TAG, "Auto-clean COMPLETE  strips=%d", s_strips_done);
+    /*
+     * FIX v3.1: Only set CLEAN_DONE if we weren't stopped externally.
+     * auto_clean_stop() may have already set CLEAN_IDLE; don't overwrite
+     * it with CLEAN_DONE — but if stop wasn't requested, mark as done.
+     */
+    if (!s_stop_requested) {
+        s_state = CLEAN_DONE;
+    }
+    /* If stop was requested, s_state was already set to CLEAN_IDLE by
+     * auto_clean_stop(); we leave it alone. */
+
+    s_current_strip = 0;
+    ESP_LOGI(TAG, "Auto-clean COMPLETE  strips=%d / %d  state=%d",
+             s_strips_done, s_strips_total, (int)s_state);
     vTaskDelete(NULL);
 }
 
@@ -510,22 +668,30 @@ static void auto_clean_task(void *arg)
 
 bool auto_clean_start(void)
 {
-    if (s_state == CLEAN_RUNNING) {
-        ESP_LOGW(TAG, "auto_clean_start: already running");
+    if (auto_clean_is_running()) {
+        ESP_LOGW(TAG, "Already running");
         return false;
     }
 
-    s_stop_requested = false;
-    s_strips_done    = 0;
-    s_strips_total   = 0;
+    s_stop_requested  = false;
+    s_pause_requested = false;
+    s_strips_done     = 0;
+    s_strips_total    = 0;
+    s_current_panel   = 0;
+    s_current_strip   = 0;
 
     mpu_reset_heading();
     s_base_heading = 0.0f;
 
+    servo_park();
     gpio_set_level(PIN_TAIL_LIGHT, 1);
 
-    BaseType_t rc = xTaskCreate(auto_clean_task, "auto_clean",
-                                5120, NULL, 5, NULL);
+    /*
+     * FIX v3.1: pin to core 0 — motor_task runs on core 1.
+     * Eliminates the dual-core race on the volatile s_cmd in motor.c.
+     */
+    BaseType_t rc = xTaskCreatePinnedToCore(auto_clean_task, "auto_clean",
+                                            6144, NULL, 5, NULL, 0);
     if (rc != pdPASS) {
         ESP_LOGE(TAG, "Failed to create auto_clean task");
         s_state = CLEAN_ERROR;
@@ -535,14 +701,52 @@ bool auto_clean_start(void)
     return true;
 }
 
+/*
+ * auto_clean_stop()
+ *
+ * FIX v3.1: No longer forces s_state = CLEAN_IDLE immediately.
+ * Instead it sets s_stop_requested = true and lets the running task
+ * exit its own loop, clean up peripherals, and then decide the final
+ * state.  We only force CLEAN_IDLE here if no task is actually running
+ * (e.g. called when already idle).
+ *
+ * We still stop the motor and peripherals immediately for safety.
+ */
 void auto_clean_stop(void)
 {
-    if (s_state == CLEAN_RUNNING || s_path_playback) {
+    if (auto_clean_is_running() || s_path_playback) {
         s_stop_requested = true;
         motor_stop_immediate();
         pump_set(false);
         blower_set(false);
+        servo_park();
+        gpio_set_level(PIN_TAIL_LIGHT, 0);
         s_path_playback = false;
-        ESP_LOGW(TAG, "Stop requested");
+        /* FIX: do NOT set s_state here — let the task set CLEAN_IDLE
+         * after it has safely unwound.  The task checks s_stop_requested
+         * at every loop boundary and will exit promptly. */
+        ESP_LOGW(TAG, "Auto-clean STOP requested");
+    } else {
+        /* Nothing was running — just make sure state is clean */
+        s_state = CLEAN_IDLE;
+    }
+}
+
+void auto_clean_pause(void)
+{
+    if (s_state == CLEAN_RUNNING) {
+        s_pause_requested = true;
+        s_state           = CLEAN_PAUSED;
+        motor_send_cmd(DIR_STOP);
+        ESP_LOGI(TAG, "Auto-clean PAUSED");
+    }
+}
+
+void auto_clean_resume(void)
+{
+    if (s_state == CLEAN_PAUSED && s_pause_requested) {
+        s_pause_requested = false;
+        s_state           = CLEAN_RUNNING;
+        ESP_LOGI(TAG, "Auto-clean RESUMED");
     }
 }

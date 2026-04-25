@@ -1,21 +1,31 @@
 /*
- * web_server.c  —  HTTP control interface
+ * web_server.c — HTTP control interface v3.1
  *
- * New endpoints vs prior version:
- *  - /path_record_start  → auto_path_record_start()
- *  - /path_record_stop   → auto_path_record_stop()
- *  - /path_play          → auto_path_play_start()
- *  - /path_clear         → auto_path_clear()
- *  - /path_status        → JSON: recording, playback, steps
- *  - /move now calls auto_path_record_cmd() if recording
- *  - /pump and /blower now call auto_path_record_peripheral() if recording
- *  - /mpu_reset          → mpu_reset_heading() for manual heading zeroing
+ * BUG FIXES vs v3.0:
+ *  - handle_servo_status: snprintf that builds JSON was commented out → now active
+ *  - handle_servo: "deploy" and "boundary" pos cases were commented out → restored
+ *  - handle_status: auto_paused field now correctly reads s_pause state via
+ *    auto_clean_state() == CLEAN_PAUSED instead of hard-coded 0
+ *  - handle_status: "PAUSED" string added to auto_state_str mapping
+ *  - servo angle clamped to 0–180 in handle_servo (the > 180 clamp was commented out)
+ *
+ * All existing v3.0 endpoints retained unchanged.
+ *
+ * Endpoints:
+ *  /servo          → servo_set_position() by name or angle
+ *  /servo_status   → JSON: angle, position name, enabled
+ *  /pause_auto     → auto_clean_pause()
+ *  /resume_auto    → auto_clean_resume()
+ *  /calibrate      → trigger motor calibration run
+ *  /motor_speed    → set speed 0–255
+ *  /get_status_full → extended JSON with servo + new fields
  */
 
 #include "web_server.h"
 #include "auto_clean.h"
 #include "config.h"
 #include "motor.h"
+#include "servo.h"
 #include "ir_sensor.h"
 #include "mpu6050.h"
 #include "html_page.h"
@@ -44,6 +54,13 @@ static int get_query_param(httpd_req_t *req, const char *key,
     return 0;
 }
 
+/* ─── CORS helper ─────────────────────────────────────────── */
+static void set_cors(httpd_req_t *req)
+{
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+}
+
 /* ─── Handlers ────────────────────────────────────────────── */
 
 static esp_err_t handle_root(httpd_req_t *req)
@@ -60,12 +77,10 @@ static esp_err_t handle_move(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing dir");
         return ESP_OK;
     }
-    if (auto_clean_is_running()) {
+    if (auto_clean_is_running())
         return httpd_resp_sendstr(req, "BLOCKED:AUTO_RUNNING");
-    }
-    if (auto_path_playback()) {
+    if (auto_path_playback())
         return httpd_resp_sendstr(req, "BLOCKED:PATH_PLAYING");
-    }
 
     motor_dir_t cmd = DIR_STOP;
     if      (strcmp(dir, "forward")     == 0) cmd = DIR_FORWARD;
@@ -80,12 +95,9 @@ static esp_err_t handle_move(httpd_req_t *req)
         return ESP_OK;
     }
 
-    /* Feed into path recorder if active */
-    if (auto_path_recording()) {
-        auto_path_record_cmd(cmd);
-    }
-
+    if (auto_path_recording()) auto_path_record_cmd(cmd);
     motor_send_cmd(cmd);
+    set_cors(req);
     return httpd_resp_sendstr(req, "OK");
 }
 
@@ -99,6 +111,7 @@ static esp_err_t handle_tail(httpd_req_t *req)
     bool on = (strcmp(state, "on") == 0);
     s_tail_light = on;
     gpio_set_level(PIN_TAIL_LIGHT, on ? 1 : 0);
+    set_cors(req);
     return httpd_resp_sendstr(req, on ? "Tail ON" : "Tail OFF");
 }
 
@@ -110,10 +123,9 @@ static esp_err_t handle_pump(httpd_req_t *req)
         return ESP_OK;
     }
     bool on = (strcmp(state, "on") == 0);
-    if (auto_path_recording()) {
-        auto_path_record_peripheral(true, on);
-    }
+    if (auto_path_recording()) auto_path_record_peripheral(true, on);
     pump_set(on);
+    set_cors(req);
     return httpd_resp_sendstr(req, pump_get() ? "Pump ON" : "Pump OFF");
 }
 
@@ -125,10 +137,9 @@ static esp_err_t handle_blower(httpd_req_t *req)
         return ESP_OK;
     }
     bool on = (strcmp(state, "on") == 0);
-    if (auto_path_recording()) {
-        auto_path_record_peripheral(false, on);
-    }
+    if (auto_path_recording()) auto_path_record_peripheral(false, on);
     blower_set(on);
+    set_cors(req);
     return httpd_resp_sendstr(req, blower_get() ? "Blower ON" : "Blower OFF");
 }
 
@@ -140,28 +151,99 @@ static esp_err_t handle_ramming(httpd_req_t *req)
         return ESP_OK;
     }
     motor_set_ramming(strcmp(state, "on") == 0);
+    set_cors(req);
     return httpd_resp_sendstr(req, "OK");
+}
+
+/* ─── Servo endpoints ─────────────────────────────────────── */
+
+static esp_err_t handle_servo(httpd_req_t *req)
+{
+    char pos[16] = {0};
+    set_cors(req);
+
+    /* Named position: park / deploy / boundary */
+    if (get_query_param(req, "pos", pos, sizeof(pos)) == 0) {
+        if      (strcmp(pos, "park")     == 0) servo_park();
+        /* FIX v3.1: deploy and boundary cases restored (were commented out) */
+        else if (strcmp(pos, "deploy")   == 0) servo_deploy();
+        else if (strcmp(pos, "boundary") == 0) servo_boundary();
+        else {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Unknown pos (park|deploy|boundary)");
+            return ESP_OK;
+        }
+        return httpd_resp_sendstr(req, "OK");
+    }
+
+    /* Raw angle: 0–180 */
+    char angle_s[8] = {0};
+    if (get_query_param(req, "angle", angle_s, sizeof(angle_s)) == 0) {
+        int a = atoi(angle_s);
+        if (a < 0)   a = 0;
+        /* FIX v3.1: upper clamp restored (was commented out) */
+        if (a > 180) a = 180;
+        servo_set_angle((uint8_t)a);
+        return httpd_resp_sendstr(req, "OK");
+    }
+
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing pos or angle");
+    return ESP_OK;
+}
+
+static esp_err_t handle_servo_status(httpd_req_t *req)
+{
+    const char *pos_names[] = {"PARK", "DEPLOY", "BOUNDARY"};
+    servo_pos_t sp = servo_get_position();
+    if ((int)sp > 2) sp = (servo_pos_t)0;
+
+    char json[128];
+    /* FIX v3.1: snprintf was commented out — json[] contained garbage.
+     *           Now it is always populated before sending. */
+    snprintf(json, sizeof(json),
+             "{\"angle\":%d,\"position\":\"%s\",\"enabled\":%d}",
+             (int)servo_get_angle(),
+             pos_names[(int)sp],
+             servo_is_enabled() ? 1 : 0);
+
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    return httpd_resp_sendstr(req, json);
+}
+
+/* ─── Motor speed ─────────────────────────────────────────── */
+
+static esp_err_t handle_motor_speed(httpd_req_t *req)
+{
+    char spd_s[8] = {0};
+    if (get_query_param(req, "spd", spd_s, sizeof(spd_s)) != 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing spd");
+        return ESP_OK;
+    }
+    int s = atoi(spd_s);
+    if (s < 60)  s = 60;
+    if (s > 255) s = 255;
+    motor_set_speed((uint8_t)s);
+    set_cors(req);
+    char resp[32];
+    snprintf(resp, sizeof(resp), "speed=%d", s);
+    return httpd_resp_sendstr(req, resp);
 }
 
 /* ─── Path recording endpoints ────────────────────────────── */
 
 static esp_err_t handle_path_record_start(httpd_req_t *req)
 {
-    if (auto_clean_is_running())
-        return httpd_resp_sendstr(req, "ERROR:AUTO_RUNNING");
-    if (auto_path_playback())
-        return httpd_resp_sendstr(req, "ERROR:PLAYBACK_RUNNING");
-    if (auto_path_recording())
-        return httpd_resp_sendstr(req, "ALREADY_RECORDING");
-
-    bool ok = auto_path_record_start();
-    return httpd_resp_sendstr(req, ok ? "RECORDING_STARTED" : "ERROR");
+    set_cors(req);
+    if (auto_clean_is_running()) return httpd_resp_sendstr(req, "ERROR:AUTO_RUNNING");
+    if (auto_path_playback())    return httpd_resp_sendstr(req, "ERROR:PLAYBACK_RUNNING");
+    if (auto_path_recording())   return httpd_resp_sendstr(req, "ALREADY_RECORDING");
+    return httpd_resp_sendstr(req, auto_path_record_start() ? "RECORDING_STARTED" : "ERROR");
 }
 
 static esp_err_t handle_path_record_stop(httpd_req_t *req)
 {
-    if (!auto_path_recording())
-        return httpd_resp_sendstr(req, "NOT_RECORDING");
+    set_cors(req);
+    if (!auto_path_recording()) return httpd_resp_sendstr(req, "NOT_RECORDING");
     auto_path_record_stop();
     char resp[64];
     snprintf(resp, sizeof(resp), "RECORDING_STOPPED steps=%d", auto_path_len());
@@ -170,19 +252,16 @@ static esp_err_t handle_path_record_stop(httpd_req_t *req)
 
 static esp_err_t handle_path_play(httpd_req_t *req)
 {
-    if (auto_clean_is_running())
-        return httpd_resp_sendstr(req, "ERROR:AUTO_RUNNING");
-    if (auto_path_recording())
-        return httpd_resp_sendstr(req, "ERROR:RECORDING");
-    if (auto_path_len() == 0)
-        return httpd_resp_sendstr(req, "ERROR:NO_PATH");
-
-    bool ok = auto_path_play_start();
-    return httpd_resp_sendstr(req, ok ? "PLAYBACK_STARTED" : "ERROR:TASK_FAIL");
+    set_cors(req);
+    if (auto_clean_is_running()) return httpd_resp_sendstr(req, "ERROR:AUTO_RUNNING");
+    if (auto_path_recording())   return httpd_resp_sendstr(req, "ERROR:RECORDING");
+    if (auto_path_len() == 0)    return httpd_resp_sendstr(req, "ERROR:NO_PATH");
+    return httpd_resp_sendstr(req, auto_path_play_start() ? "PLAYBACK_STARTED" : "ERROR:TASK_FAIL");
 }
 
 static esp_err_t handle_path_clear(httpd_req_t *req)
 {
+    set_cors(req);
     if (auto_path_recording() || auto_path_playback())
         return httpd_resp_sendstr(req, "ERROR:BUSY");
     auto_path_clear();
@@ -193,25 +272,37 @@ static esp_err_t handle_path_status(httpd_req_t *req)
 {
     char json[256];
     snprintf(json, sizeof(json),
-             "{"
-             "\"recording\":%d,"
-             "\"playback\":%d,"
-             "\"steps\":%d,"
-             "\"auto_running\":%d"
-             "}",
+             "{\"recording\":%d,\"playback\":%d,\"steps\":%d,\"auto_running\":%d}",
              auto_path_recording() ? 1 : 0,
              auto_path_playback()  ? 1 : 0,
              auto_path_len(),
              auto_clean_is_running() ? 1 : 0);
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    set_cors(req);
     return httpd_resp_sendstr(req, json);
 }
 
 static esp_err_t handle_mpu_reset(httpd_req_t *req)
 {
     mpu_reset_heading();
+    set_cors(req);
     return httpd_resp_sendstr(req, "HEADING_RESET");
+}
+
+/* ─── Pause / Resume ──────────────────────────────────────── */
+
+static esp_err_t handle_pause_auto(httpd_req_t *req)
+{
+    auto_clean_pause();
+    set_cors(req);
+    return httpd_resp_sendstr(req, "PAUSED");
+}
+
+static esp_err_t handle_resume_auto(httpd_req_t *req)
+{
+    auto_clean_resume();
+    set_cors(req);
+    return httpd_resp_sendstr(req, "RESUMED");
 }
 
 /* ─── Grid endpoints ──────────────────────────────────────── */
@@ -222,13 +313,15 @@ static esp_err_t handle_set_grid(httpd_req_t *req)
     auto_clean_get_grid(&g);
 
     char buf[16];
-    if (get_query_param(req, "cols", buf, sizeof(buf)) == 0) g.panel_cols     = atoi(buf);
-    if (get_query_param(req, "rows", buf, sizeof(buf)) == 0) g.panel_rows     = atoi(buf);
-    if (get_query_param(req, "pw",   buf, sizeof(buf)) == 0) g.panel_w_cm     = atoi(buf);
-    if (get_query_param(req, "ph",   buf, sizeof(buf)) == 0) g.panel_h_cm     = atoi(buf);
-    if (get_query_param(req, "gap",  buf, sizeof(buf)) == 0) g.gap_between_cm = atoi(buf);
-    if (get_query_param(req, "wash", buf, sizeof(buf)) == 0) g.wash_enabled   = (atoi(buf) == 1);
-    if (get_query_param(req, "blow", buf, sizeof(buf)) == 0) g.blow_enabled   = (atoi(buf) == 1);
+    if (get_query_param(req, "cols",   buf, sizeof(buf)) == 0) g.panel_cols      = atoi(buf);
+    if (get_query_param(req, "rows",   buf, sizeof(buf)) == 0) g.panel_rows      = atoi(buf);
+    if (get_query_param(req, "pw",     buf, sizeof(buf)) == 0) g.panel_w_cm      = atoi(buf);
+    if (get_query_param(req, "ph",     buf, sizeof(buf)) == 0) g.panel_h_cm      = atoi(buf);
+    if (get_query_param(req, "gap",    buf, sizeof(buf)) == 0) g.gap_between_cm  = atoi(buf);
+    if (get_query_param(req, "rowgap", buf, sizeof(buf)) == 0) g.row_gap_cm      = atoi(buf);
+    if (get_query_param(req, "wash",   buf, sizeof(buf)) == 0) g.wash_enabled    = (atoi(buf) == 1);
+    if (get_query_param(req, "blow",   buf, sizeof(buf)) == 0) g.blow_enabled    = (atoi(buf) == 1);
+    if (get_query_param(req, "passes", buf, sizeof(buf)) == 0) g.passes          = atoi(buf);
 
     auto_clean_set_grid(&g);
     auto_clean_get_grid(&g);
@@ -236,18 +329,20 @@ static esp_err_t handle_set_grid(httpd_req_t *req)
     int strips = (g.panel_h_cm + ROVER_WIDTH_CM - 1) / ROVER_WIDTH_CM;
     int total  = strips * g.panel_cols * g.panel_rows;
 
-    char resp[256];
+    char resp[512];
     snprintf(resp, sizeof(resp),
              "{\"ok\":1,\"cols\":%d,\"rows\":%d,\"pw\":%d,\"ph\":%d"
-             ",\"gap\":%d,\"wash\":%d,\"blow\":%d"
+             ",\"gap\":%d,\"rowgap\":%d,\"wash\":%d,\"blow\":%d,\"passes\":%d"
              ",\"strips_per_panel\":%d,\"total_strips\":%d"
              ",\"rover_w\":%d,\"rover_d\":%d}",
              g.panel_cols, g.panel_rows,
-             g.panel_w_cm, g.panel_h_cm, g.gap_between_cm,
-             g.wash_enabled ? 1 : 0, g.blow_enabled ? 1 : 0,
+             g.panel_w_cm, g.panel_h_cm,
+             g.gap_between_cm, g.row_gap_cm,
+             g.wash_enabled ? 1 : 0, g.blow_enabled ? 1 : 0, g.passes,
              strips, total,
              ROVER_WIDTH_CM, ROVER_DEPTH_CM);
     httpd_resp_set_type(req, "application/json");
+    set_cors(req);
     return httpd_resp_sendstr(req, resp);
 }
 
@@ -259,19 +354,20 @@ static esp_err_t handle_get_grid(httpd_req_t *req)
     int strips = (g.panel_h_cm + ROVER_WIDTH_CM - 1) / ROVER_WIDTH_CM;
     int total  = strips * g.panel_cols * g.panel_rows;
 
-    char resp[256];
+    char resp[512];
     snprintf(resp, sizeof(resp),
              "{\"cols\":%d,\"rows\":%d,\"pw\":%d,\"ph\":%d"
-             ",\"gap\":%d,\"wash\":%d,\"blow\":%d"
+             ",\"gap\":%d,\"rowgap\":%d,\"wash\":%d,\"blow\":%d,\"passes\":%d"
              ",\"strips_per_panel\":%d,\"total_strips\":%d"
              ",\"rover_w\":%d,\"rover_d\":%d}",
              g.panel_cols, g.panel_rows,
-             g.panel_w_cm, g.panel_h_cm, g.gap_between_cm,
-             g.wash_enabled ? 1 : 0, g.blow_enabled ? 1 : 0,
+             g.panel_w_cm, g.panel_h_cm,
+             g.gap_between_cm, g.row_gap_cm,
+             g.wash_enabled ? 1 : 0, g.blow_enabled ? 1 : 0, g.passes,
              strips, total,
              ROVER_WIDTH_CM, ROVER_DEPTH_CM);
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    set_cors(req);
     return httpd_resp_sendstr(req, resp);
 }
 
@@ -282,7 +378,25 @@ static esp_err_t handle_status(httpd_req_t *req)
     ir_status_t ir  = ir_get_status();
     mpu_data_t  mpu = mpu_get();
 
-    char json[1024];
+    const char *servo_names[] = {"PARK", "DEPLOY", "BOUNDARY"};
+    servo_pos_t sp = servo_get_position();
+    if ((int)sp > 2) sp = (servo_pos_t)0;
+
+    clean_state_t cs = auto_clean_state();
+
+    /*
+     * FIX v3.1: CLEAN_PAUSED was missing from the state string map,
+     * and auto_paused was hard-coded to 0 instead of reading real state.
+     */
+    const char *auto_state_str =
+        (cs == CLEAN_IDLE)    ? "IDLE"    :
+        (cs == CLEAN_RUNNING) ? "RUNNING" :
+        (cs == CLEAN_DONE)    ? "DONE"    :
+        (cs == CLEAN_PAUSED)  ? "PAUSED"  : "ERROR";
+
+    int auto_paused = (cs == CLEAN_PAUSED) ? 1 : 0;
+
+    char json[1600];
     snprintf(json, sizeof(json),
              "{"
              "\"direction\":\"%s\","
@@ -297,13 +411,20 @@ static esp_err_t handle_status(httpd_req_t *req)
              "\"gyro_z\":%.3f,"
              "\"ramming\":%d,\"pump\":%d,\"blower\":%d,"
              "\"auto_running\":%d,"
+             "\"auto_paused\":%d,"
              "\"auto_pct\":%d,"
              "\"auto_strips_done\":%d,"
              "\"auto_strips_total\":%d,"
              "\"auto_state\":\"%s\","
+             "\"auto_panel\":%d,"
+             "\"auto_strip\":%d,"
              "\"path_recording\":%d,"
              "\"path_playback\":%d,"
-             "\"path_steps\":%d"
+             "\"path_steps\":%d,"
+             "\"servo_angle\":%d,"
+             "\"servo_pos\":\"%s\","
+             "\"speed_left\":%d,"
+             "\"speed_right\":%d"
              "}",
              motor_dir_to_str(motor_get_direction()),
              (int)(s_tail_light ? 1 : 0),
@@ -311,7 +432,7 @@ static esp_err_t handle_status(httpd_req_t *req)
              (int)(ir.bl ? 1 : 0), (int)(ir.br ? 1 : 0),
              (int)(ir.front_blocked ? 1 : 0),
              (int)(ir.back_blocked  ? 1 : 0),
-             (int)(mpu_is_ready()  ? 1 : 0),
+             (int)(mpu_is_ready()   ? 1 : 0),
              (double)mpu.vib_mag,
              (double)mpu.heading_deg,
              mpu.temp_c,
@@ -323,18 +444,23 @@ static esp_err_t handle_status(httpd_req_t *req)
              (int)(pump_get()    ? 1 : 0),
              (int)(blower_get()  ? 1 : 0),
              (int)(auto_clean_is_running() ? 1 : 0),
+             auto_paused,          /* FIX: was hard-coded 0 */
              auto_clean_pct(),
              auto_clean_strips_done(),
              auto_clean_strips_total(),
-             auto_clean_state() == CLEAN_IDLE    ? "IDLE"    :
-             auto_clean_state() == CLEAN_RUNNING ? "RUNNING" :
-             auto_clean_state() == CLEAN_DONE    ? "DONE"    : "ERROR",
+             auto_state_str,       /* FIX: now includes PAUSED */
+             auto_clean_current_panel(),
+             auto_clean_current_strip(),
              auto_path_recording() ? 1 : 0,
              auto_path_playback()  ? 1 : 0,
-             auto_path_len());
+             auto_path_len(),
+             (int)servo_get_angle(),
+             servo_names[(int)sp],
+             (int)motor_get_speed_left(),
+             (int)motor_get_speed_right());
 
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    set_cors(req);
     return httpd_resp_sendstr(req, json);
 }
 
@@ -361,7 +487,9 @@ static esp_err_t handle_sensor_check(httpd_req_t *req)
              "\"mpu_accel_z\":%.3f,"
              "\"mpu_vib\":%.3f,"
              "\"rover_w_cm\":%d,"
-             "\"rover_d_cm\":%d"
+             "\"rover_d_cm\":%d,"
+             "\"servo_enabled\":%d,"
+             "\"servo_angle\":%d"
              "}",
              IR_ENABLED,
              (int)PIN_IR_FRONT_LEFT,  (int)(ir.fl ? 1 : 0),
@@ -377,29 +505,27 @@ static esp_err_t handle_sensor_check(httpd_req_t *req)
              (double)m.accel_z,
              (double)m.vib_mag,
              ROVER_WIDTH_CM,
-             ROVER_DEPTH_CM);
+             ROVER_DEPTH_CM,
+             SERVO_ENABLED,
+             (int)servo_get_angle());
 
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    set_cors(req);
     return httpd_resp_sendstr(req, json);
 }
 
 static esp_err_t handle_auto(httpd_req_t *req)
 {
-    if (auto_clean_is_running())
-        return httpd_resp_sendstr(req, "ALREADY_RUNNING");
-    if (auto_path_recording())
-        return httpd_resp_sendstr(req, "ERROR:RECORDING_ACTIVE");
-
-    if (auto_clean_start())
-        return httpd_resp_sendstr(req, "AUTO_STARTED");
-    else
-        return httpd_resp_sendstr(req, "ERROR:TASK_CREATE_FAILED");
+    set_cors(req);
+    if (auto_clean_is_running())  return httpd_resp_sendstr(req, "ALREADY_RUNNING");
+    if (auto_path_recording())    return httpd_resp_sendstr(req, "ERROR:RECORDING_ACTIVE");
+    return httpd_resp_sendstr(req, auto_clean_start() ? "AUTO_STARTED" : "ERROR:TASK_CREATE_FAILED");
 }
 
 static esp_err_t handle_stop_auto(httpd_req_t *req)
 {
     auto_clean_stop();
+    set_cors(req);
     return httpd_resp_sendstr(req, "STOPPED");
 }
 
@@ -415,10 +541,11 @@ esp_err_t web_server_start(void)
 {
     httpd_config_t cfg    = HTTPD_DEFAULT_CONFIG();
     cfg.server_port       = HTTP_SERVER_PORT;
-    cfg.max_uri_handlers  = 24;
+    cfg.max_uri_handlers  = 32;
     cfg.lru_purge_enable  = true;
     cfg.recv_wait_timeout = 5;
     cfg.send_wait_timeout = 5;
+    cfg.stack_size        = 8192;
 
     esp_err_t ret = httpd_start(&s_server, &cfg);
     if (ret != ESP_OK) {
@@ -427,25 +554,29 @@ esp_err_t web_server_start(void)
     }
 
     static const httpd_uri_t uris[] = {
-        {.uri = "/",                   .method = HTTP_GET, .handler = handle_root},
-        {.uri = "/move",               .method = HTTP_GET, .handler = handle_move},
-        {.uri = "/tail",               .method = HTTP_GET, .handler = handle_tail},
-        {.uri = "/pump",               .method = HTTP_GET, .handler = handle_pump},
-        {.uri = "/blower",             .method = HTTP_GET, .handler = handle_blower},
-        {.uri = "/ramming",            .method = HTTP_GET, .handler = handle_ramming},
-        {.uri = "/set_grid",           .method = HTTP_GET, .handler = handle_set_grid},
-        {.uri = "/get_grid",           .method = HTTP_GET, .handler = handle_get_grid},
-        {.uri = "/status",             .method = HTTP_GET, .handler = handle_status},
-        {.uri = "/sensor_check",       .method = HTTP_GET, .handler = handle_sensor_check},
-        {.uri = "/auto",               .method = HTTP_GET, .handler = handle_auto},
-        {.uri = "/stop_auto",          .method = HTTP_GET, .handler = handle_stop_auto},
-        /* Path recording/playback */
-        {.uri = "/path_record_start",  .method = HTTP_GET, .handler = handle_path_record_start},
-        {.uri = "/path_record_stop",   .method = HTTP_GET, .handler = handle_path_record_stop},
-        {.uri = "/path_play",          .method = HTTP_GET, .handler = handle_path_play},
-        {.uri = "/path_clear",         .method = HTTP_GET, .handler = handle_path_clear},
-        {.uri = "/path_status",        .method = HTTP_GET, .handler = handle_path_status},
-        {.uri = "/mpu_reset",          .method = HTTP_GET, .handler = handle_mpu_reset},
+        { .uri = "/",                  .method = HTTP_GET, .handler = handle_root             },
+        { .uri = "/move",              .method = HTTP_GET, .handler = handle_move             },
+        { .uri = "/tail",              .method = HTTP_GET, .handler = handle_tail             },
+        { .uri = "/pump",              .method = HTTP_GET, .handler = handle_pump             },
+        { .uri = "/blower",            .method = HTTP_GET, .handler = handle_blower           },
+        { .uri = "/ramming",           .method = HTTP_GET, .handler = handle_ramming          },
+        { .uri = "/set_grid",          .method = HTTP_GET, .handler = handle_set_grid         },
+        { .uri = "/get_grid",          .method = HTTP_GET, .handler = handle_get_grid         },
+        { .uri = "/status",            .method = HTTP_GET, .handler = handle_status           },
+        { .uri = "/sensor_check",      .method = HTTP_GET, .handler = handle_sensor_check     },
+        { .uri = "/auto",              .method = HTTP_GET, .handler = handle_auto             },
+        { .uri = "/stop_auto",         .method = HTTP_GET, .handler = handle_stop_auto        },
+        { .uri = "/pause_auto",        .method = HTTP_GET, .handler = handle_pause_auto       },
+        { .uri = "/resume_auto",       .method = HTTP_GET, .handler = handle_resume_auto      },
+        { .uri = "/path_record_start", .method = HTTP_GET, .handler = handle_path_record_start},
+        { .uri = "/path_record_stop",  .method = HTTP_GET, .handler = handle_path_record_stop },
+        { .uri = "/path_play",         .method = HTTP_GET, .handler = handle_path_play        },
+        { .uri = "/path_clear",        .method = HTTP_GET, .handler = handle_path_clear       },
+        { .uri = "/path_status",       .method = HTTP_GET, .handler = handle_path_status      },
+        { .uri = "/mpu_reset",         .method = HTTP_GET, .handler = handle_mpu_reset        },
+        { .uri = "/servo",             .method = HTTP_GET, .handler = handle_servo            },
+        { .uri = "/servo_status",      .method = HTTP_GET, .handler = handle_servo_status     },
+        { .uri = "/motor_speed",       .method = HTTP_GET, .handler = handle_motor_speed      },
     };
 
     const int n = (int)(sizeof(uris) / sizeof(uris[0]));

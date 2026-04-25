@@ -2,9 +2,9 @@ idf_component_register(
     SRCS
         "main.c"
         "motor.c"
+        "servo.c"
         "ir_sensor.c"
         "Mpu6050.c"
-        # "telegram.c"
         "web_server.c"
         "auto_clean.c"
         "html_page.c"

@@ -24,7 +24,7 @@
 #include "esp_netif.h"
 #include "nvs_flash.h"
 #include "driver/gpio.h"
-
+#include "servo.h"
 #include "config.h"
 #include "motor.h"
 #include "ir_sensor.h"
@@ -36,32 +36,38 @@ static const char *TAG = "MAIN";
 
 /* ─── WiFi ────────────────────────────────────────────────── */
 static EventGroupHandle_t s_wifi_events;
-#define WIFI_STA_CONNECTED_BIT  BIT0
-#define WIFI_STA_FAIL_BIT       BIT1
+#define WIFI_STA_CONNECTED_BIT BIT0
+#define WIFI_STA_FAIL_BIT BIT1
 
 static int s_sta_retries = 0;
 
 static void wifi_event_handler(void *arg,
-                                esp_event_base_t base,
-                                int32_t          event_id,
-                                void            *event_data)
+                               esp_event_base_t base,
+                               int32_t event_id,
+                               void *event_data)
 {
-    if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+    if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
+    {
         esp_wifi_connect();
-
-    } else if (base == WIFI_EVENT &&
-               event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (s_sta_retries < STA_MAX_RETRIES) {
+    }
+    else if (base == WIFI_EVENT &&
+             event_id == WIFI_EVENT_STA_DISCONNECTED)
+    {
+        if (s_sta_retries < STA_MAX_RETRIES)
+        {
             esp_wifi_connect();
             s_sta_retries++;
             ESP_LOGW(TAG, "WiFi STA reconnect %d/%d",
                      s_sta_retries, (int)STA_MAX_RETRIES);
-        } else {
+        }
+        else
+        {
             xEventGroupSetBits(s_wifi_events, WIFI_STA_FAIL_BIT);
             ESP_LOGE(TAG, "STA failed -- AP still active");
         }
-
-    } else if (base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+    }
+    else if (base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
+    {
         s_sta_retries = 0;
         xEventGroupSetBits(s_wifi_events, WIFI_STA_CONNECTED_BIT);
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)event_data;
@@ -83,41 +89,44 @@ static void wifi_init(void)
 
     esp_event_handler_instance_t inst_any, inst_got_ip;
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        WIFI_EVENT, ESP_EVENT_ANY_ID,    wifi_event_handler, NULL, &inst_any));
+        WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL, &inst_any));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        IP_EVENT,  IP_EVENT_STA_GOT_IP,  wifi_event_handler, NULL, &inst_got_ip));
+        IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL, &inst_got_ip));
 
     wifi_config_t sta_cfg = {0};
-    strncpy((char *)sta_cfg.sta.ssid,     STA_SSID,
-            sizeof(sta_cfg.sta.ssid)     - 1);
+    strncpy((char *)sta_cfg.sta.ssid, STA_SSID,
+            sizeof(sta_cfg.sta.ssid) - 1);
     strncpy((char *)sta_cfg.sta.password, STA_PASSWORD,
             sizeof(sta_cfg.sta.password) - 1);
     sta_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
 
     wifi_config_t ap_cfg = {0};
-    strncpy((char *)ap_cfg.ap.ssid,     AP_SSID,
-            sizeof(ap_cfg.ap.ssid)     - 1);
+    strncpy((char *)ap_cfg.ap.ssid, AP_SSID,
+            sizeof(ap_cfg.ap.ssid) - 1);
     strncpy((char *)ap_cfg.ap.password, AP_PASSWORD,
             sizeof(ap_cfg.ap.password) - 1);
-    ap_cfg.ap.ssid_len       = (uint8_t)strlen(AP_SSID);
-    ap_cfg.ap.channel        = AP_CHANNEL;
-    ap_cfg.ap.authmode       = WIFI_AUTH_WPA_WPA2_PSK;
+    ap_cfg.ap.ssid_len = (uint8_t)strlen(AP_SSID);
+    ap_cfg.ap.channel = AP_CHANNEL;
+    ap_cfg.ap.authmode = WIFI_AUTH_WPA_WPA2_PSK;
     ap_cfg.ap.max_connection = AP_MAX_CONN;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP,  &ap_cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
 
     EventBits_t bits = xEventGroupWaitBits(
-                           s_wifi_events,
-                           WIFI_STA_CONNECTED_BIT | WIFI_STA_FAIL_BIT,
-                           pdFALSE, pdFALSE,
-                           pdMS_TO_TICKS(10000));
+        s_wifi_events,
+        WIFI_STA_CONNECTED_BIT | WIFI_STA_FAIL_BIT,
+        pdFALSE, pdFALSE,
+        pdMS_TO_TICKS(10000));
 
-    if (bits & WIFI_STA_CONNECTED_BIT) {
+    if (bits & WIFI_STA_CONNECTED_BIT)
+    {
         ESP_LOGI(TAG, "STA connected to '%s'", STA_SSID);
-    } else {
+    }
+    else
+    {
         ESP_LOGW(TAG, "STA not connected -- AP '%s' @ 192.168.4.1", AP_SSID);
     }
 }
@@ -128,7 +137,7 @@ static void serial_cmd_task(void *arg)
 {
     (void)arg;
     char buf[64];
-    int  pos = 0;
+    int pos = 0;
 
     ESP_LOGI(TAG, "Serial commands:");
     ESP_LOGI(TAG, "  AUTO    -- start auto-clean");
@@ -140,12 +149,19 @@ static void serial_cmd_task(void *arg)
     ESP_LOGI(TAG, "  HDGRST  -- reset heading to 0");
     ESP_LOGI(TAG, "  GRID    -- show current grid config");
 
-    while (1) {
+    while (1)
+    {
         int c = fgetc(stdin);
-        if (c == EOF) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
-        if (c == '\r') continue;
+        if (c == EOF)
+        {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        if (c == '\r')
+            continue;
 
-        if (c == '\n' || pos >= (int)(sizeof(buf) - 1)) {
+        if (c == '\n' || pos >= (int)(sizeof(buf) - 1))
+        {
             buf[pos] = '\0';
             pos = 0;
 
@@ -153,32 +169,46 @@ static void serial_cmd_task(void *arg)
                 buf[i] = (char)toupper((unsigned char)buf[i]);
 
             /* ── AUTO ── */
-            if (strcmp(buf, "AUTO") == 0) {
-                if (auto_clean_is_running()) {
+            if (strcmp(buf, "AUTO") == 0)
+            {
+                if (auto_clean_is_running())
+                {
                     ESP_LOGW(TAG, "[SERIAL] AUTO -- already running");
-                } else if (auto_clean_start()) {
+                }
+                else if (auto_clean_start())
+                {
                     ESP_LOGI(TAG, "[SERIAL] AUTO -- started");
-                } else {
+                }
+                else
+                {
                     ESP_LOGE(TAG, "[SERIAL] AUTO -- failed to start");
                 }
 
-            /* ── STOP ── */
-            } else if (strcmp(buf, "STOP") == 0) {
+                /* ── STOP ── */
+            }
+            else if (strcmp(buf, "STOP") == 0)
+            {
                 auto_clean_stop();
                 ESP_LOGI(TAG, "[SERIAL] STOP -- stop requested");
 
-            /* ── HDG ── */
-            } else if (strcmp(buf, "HDG") == 0) {
+                /* ── HDG ── */
+            }
+            else if (strcmp(buf, "HDG") == 0)
+            {
                 ESP_LOGI(TAG, "[SERIAL] Heading=%.1f deg",
                          (double)mpu_heading());
 
-            /* ── HDGRST ── */
-            } else if (strcmp(buf, "HDGRST") == 0) {
+                /* ── HDGRST ── */
+            }
+            else if (strcmp(buf, "HDGRST") == 0)
+            {
                 mpu_reset_heading();
                 ESP_LOGI(TAG, "[SERIAL] Heading reset to 0");
 
-            /* ── IR ── */
-            } else if (strcmp(buf, "IR") == 0) {
+                /* ── IR ── */
+            }
+            else if (strcmp(buf, "IR") == 0)
+            {
                 ir_status_t ir = ir_get_status();
                 ESP_LOGI(TAG, "=== IR STATUS ===");
                 ESP_LOGI(TAG, "  Front-Left  (pin %d): %s",
@@ -195,10 +225,12 @@ static void serial_cmd_task(void *arg)
                          ir.br ? "BLOCKED" : "CLEAR");
                 ESP_LOGI(TAG, "  Front zone: %s  |  Back zone: %s",
                          ir.front_blocked ? "BLOCKED" : "CLEAR",
-                         ir.back_blocked  ? "BLOCKED" : "CLEAR");
+                         ir.back_blocked ? "BLOCKED" : "CLEAR");
 
-            /* ── MPU ── */
-            } else if (strcmp(buf, "MPU") == 0) {
+                /* ── MPU ── */
+            }
+            else if (strcmp(buf, "MPU") == 0)
+            {
                 mpu_data_t d = mpu_get();
                 ESP_LOGI(TAG, "=== MPU STATUS ===");
                 ESP_LOGI(TAG, "  Ready:   %s", mpu_is_ready() ? "YES" : "NO");
@@ -211,9 +243,11 @@ static void serial_cmd_task(void *arg)
                 ESP_LOGI(TAG, "  Vib:     %.4f g", (double)d.vib_mag);
                 ESP_LOGI(TAG, "  Temp:    %d C", d.temp_c);
 
-            /* ── STATUS ── */
-            } else if (strcmp(buf, "STATUS") == 0) {
-                mpu_data_t  d  = mpu_get();
+                /* ── STATUS ── */
+            }
+            else if (strcmp(buf, "STATUS") == 0)
+            {
+                mpu_data_t d = mpu_get();
                 ir_status_t ir = ir_get_status();
                 clean_grid_t g;
                 auto_clean_get_grid(&g);
@@ -244,8 +278,10 @@ static void serial_cmd_task(void *arg)
                          auto_clean_strips_done(),
                          auto_clean_strips_total());
 
-            /* ── GRID ── */
-            } else if (strcmp(buf, "GRID") == 0) {
+                /* ── GRID ── */
+            }
+            else if (strcmp(buf, "GRID") == 0)
+            {
                 clean_grid_t g;
                 auto_clean_get_grid(&g);
                 int strips = (g.panel_w_cm + ROVER_WIDTH_CM - 1) / ROVER_WIDTH_CM;
@@ -259,12 +295,15 @@ static void serial_cmd_task(void *arg)
                 ESP_LOGI(TAG, "  Blow:         %s", g.blow_enabled ? "YES" : "NO");
                 ESP_LOGI(TAG, "  Strips/panel: %d (rover=%d cm wide)", strips, ROVER_WIDTH_CM);
                 ESP_LOGI(TAG, "  Total strips: %d", strips * g.panel_cols * g.panel_rows);
-
-            } else if (strlen(buf) > 0) {
+            }
+            else if (strlen(buf) > 0)
+            {
                 ESP_LOGW(TAG, "[SERIAL] Unknown: '%s'", buf);
                 ESP_LOGI(TAG, "  Available: AUTO | STOP | STATUS | IR | MPU | HDG | HDGRST | GRID");
             }
-        } else {
+        }
+        else
+        {
             buf[pos++] = (char)c;
         }
 
@@ -282,7 +321,8 @@ void app_main(void)
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
-        ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
         ESP_LOGW(TAG, "NVS erased and reinitialised");
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
@@ -293,9 +333,10 @@ void app_main(void)
     ir_init();
     mpu_init();
     wifi_init();
-
+    servo_init();
     ret = web_server_start();
-    if (ret != ESP_OK) {
+    if (ret != ESP_OK)
+    {
         ESP_LOGE(TAG, "Web server failed -- continuing without it");
     }
 
